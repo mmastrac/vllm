@@ -106,6 +106,7 @@ class InputProcessor:
                 self.speculative_config,
                 self.structured_outputs_config,
                 self.tokenizer,
+                diffusion_config=self.vllm_config.diffusion_config,
             )
 
             if params.thinking_token_budget is not None and (
