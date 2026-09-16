@@ -1437,16 +1437,25 @@ class DiffusionSampler:
                 if just_converged.any():
                     flat_logits = scaled.reshape(-1, scaled.shape[-1])
                     argmax_tokens = scaled.argmax(dim=-1)
+                    raw_flat: torch.Tensor | None = None
                     for local_idx in just_converged.nonzero(as_tuple=True)[0]:
                         li = local_idx.item()
-                        slot = tile_slots[local_idx]
+                        slot = tile_slots[local_idx].item()
                         # Stash only the real canvas positions (== CL unless this
                         # canvas was truncated near max_model_len); padded tail
                         # positions are never emitted.
                         k_i = int(valid_canvas_len_np[start_req + li])
                         pos = li * CL
-                        self._pending_logprobs[slot.item()] = compute_topk_scores(
-                            flat_logits[pos : pos + k_i],
+                        src = flat_logits
+                        if slot in states.read_only_slots:
+                            # A read reports the model's own distribution at
+                            # temperature 1, not the schedule-tempered one the
+                            # sampler draws from. The argmax is the same.
+                            if raw_flat is None:
+                                raw_flat = logits[start_req * CL : end_req * CL].float()
+                            src = raw_flat
+                        self._pending_logprobs[slot] = compute_topk_scores(
+                            src[pos : pos + k_i],
                             max_num_logprobs,
                             argmax_tokens[local_idx][:k_i],
                             logits_mode=self.logits_mode,
