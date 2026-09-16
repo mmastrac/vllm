@@ -5,9 +5,8 @@
 POST /v1/chat/completions with a system message that is the question schema
 and a user message that is the state. The reply's `content` is the JSON
 answer set: one calibrated distribution per question, from a single denoise
-step over a seeded canvas, averaged over a few noise draws. The canvas, the
-tokenizer, the slot resolution, the noise draws and the averaging all stay
-behind this server; clients never see a token id.
+step over a seeded canvas, averaged over a few noise draws. The canvas,
+tokenizer, slot resolution, noise draws and averaging stay behind this server.
 
 Schema (system message):
   {"questions": [
@@ -39,7 +38,7 @@ VOCAB = 262144
 TURN_CLOSE = 106
 PAD = 0
 TOPK = 20
-SCAFFOLD = None      # <|channel>thought\n<channel|>: the chat template ends at <|turn>model\n
+SCAFFOLD = None  # the empty thought block the chat template leaves to the model
 
 
 # ----------------------------------------------------------------------------
@@ -195,8 +194,8 @@ def one_read(schema, template, slots, sys_text, state_text, seed):
         top = {int(t["token"].split(":")[1]): t["logprob"] for t in content[s["pos"]]["top_logprobs"]}
         floor = min(top.values()) - 5.0
         lp_t = [top.get(i, floor) for i in s["label_ids"]]
-        # Read-only requests return temperature-1 logprobs, so the label
-        # distribution is a softmax over the labels' logprobs as they are.
+        # Read-only logprobs are at temperature 1, so the label softmax uses
+        # them directly.
         mx = max(lp_t)
         ex = [math.exp(x - mx) for x in lp_t]
         probs = [e / sum(ex) for e in ex]

@@ -2,8 +2,7 @@
 
 A discrete diffusion model denoises a whole canvas per forward pass. If the
 canvas is seeded with the answer's fixed text and only the answer slots are
-left as noise, one denoise step yields a calibrated distribution over each
-slot. Three `extra_args` fields (`vllm_xargs` on the OpenAI server) expose
+left as noise, one denoise step yields a distribution over each slot. Three `extra_args` fields (`vllm_xargs` on the OpenAI server) expose
 that:
 
 | field | type | meaning |
