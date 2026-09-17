@@ -19,7 +19,9 @@ Schema (system message):
    "samples": "auto" | N, "auto_threshold": 0.1, "auto_max": 4,
    "steps": 1}
 
-A schema whose answer lines do not fit the canvas is split into chunks
+Up to ten questions answer as "id: label" lines. Past that the id runs
+straight into the label, space separated, at one row fewer a question. A
+schema whose answer template does not fit the canvas is split into chunks
 that run together, each with its own question list ("chunk_rows" sets the
 rows per chunk, "ask" picks a subset of question ids for one read).
 
@@ -107,7 +109,22 @@ def parse_schema(value):
     sequential = bool(value.get("sequential", False))
     return {"questions": qs, "instructions": value.get("instructions"), "policy": policy,
             "steps": max(1, min(int(value.get("steps", 1)), 8)),
-            "ask": ask, "chunk_rows": chunk_rows, "chunk_prompt": chunk_prompt, "sequential": sequential}
+            "ask": ask, "chunk_rows": chunk_rows, "chunk_prompt": chunk_prompt, "sequential": sequential,
+            "format": "lines" if len(qs) <= 10 else "indexed"}
+
+
+# Answer template shape: (join between questions, what precedes the label,
+# reply instruction). "lines" is readable and is what a small schema gets.
+# "indexed" ("0yes 1no") costs three tokens a question against four or five
+# and agreed with lines on every set measured: 42 booleans, ten 26-way
+# choices, twenty 5-level scores. Past ten questions the saved rows are what
+# keep a schema in one read. Two tokens a question, or no id at all, loses
+# alignment beyond about twenty questions: the id is what ties a label to
+# its question.
+FORMATS = {
+    "lines": ("\n", "{id}: ", 'Reply with one line per question, in this order, formatted as "id: label".'),
+    "indexed": (" ", "{id}", "Reply on one line with each question's id immediately followed by its label, separated by single spaces."),
+}
 
 
 def system_text(schema, chunked=False):
@@ -124,28 +141,31 @@ def system_text(schema, chunked=False):
                 s += f"  {label}: {name} ({str(desc).strip()})\n"
             else:
                 s += f"  {label}: {name}\n"
-    s += '\nReply with one line per question, in this order, formatted as "id: label".'
+    s += "\n" + FORMATS[schema.get("format", "lines")][2]
     if chunked:
         s += " A reply may cover only some of the questions; answer every line that is present."
     return s
 
 
-def answer_text(qs, labels):
-    return "\n".join(f"{q['id']}: {q['labels'][l]}" for q, l in zip(qs, labels))
+def answer_text(qs, labels, fmt="lines"):
+    join, lead, _ = FORMATS[fmt]
+    return join.join(lead.format(id=q["id"]) + q["labels"][l] for q, l in zip(qs, labels))
 
 
 def enc(text):
     return TOK.encode(text, add_special_tokens=False)
 
 
-def resolve_template(qs, scaffold=True):
+def resolve_template(qs, scaffold=True, fmt="lines"):
     """Tokenize the answer template and find each question's slot. Every label
     must change exactly one token, at the same position for all of a question's
     labels, or the schema is refused. ``scaffold`` is False for a continuation
-    whose thought block and earlier answer lines are already in the prompt."""
+    whose thought block and earlier answers are already in the prompt; its
+    template starts with the join so the tokens match one joint template."""
     head = SCAFFOLD if scaffold else []
+    lead = "" if scaffold else FORMATS[fmt][0]
     base_labels = [0] * len(qs)
-    base = head + enc(answer_text(qs, base_labels))
+    base = head + enc(lead + answer_text(qs, base_labels, fmt))
     if len(base) + 1 > CANVAS_LEN:
         raise SchemaError(f"answer template is {len(base)} tokens; the canvas holds {CANVAS_LEN - 1}")
     if len(qs) == 1 and len(base) + 1 > CANVAS_LEN:
@@ -157,7 +177,7 @@ def resolve_template(qs, scaffold=True):
         for li in range(1, len(q["labels"])):
             labels = list(base_labels)
             labels[qi] = li
-            e = head + enc(answer_text(qs, labels))
+            e = head + enc(lead + answer_text(qs, labels, fmt))
             if len(e) != len(base):
                 raise SchemaError(f"question {q['id']!r}: label {q['labels'][li]!r} is not a single token")
             diffs = [i for i in range(len(e)) if e[i] != base[i]]
@@ -176,9 +196,10 @@ _template_cache = {}
 
 
 def template_for(schema, scaffold=True):
-    key = json.dumps([scaffold] + [(q["id"], q["labels"]) for q in schema["questions"]])
+    fmt = schema.get("format", "lines")
+    key = json.dumps([scaffold, fmt] + [(q["id"], q["labels"]) for q in schema["questions"]])
     if key not in _template_cache:
-        _template_cache[key] = resolve_template(schema["questions"], scaffold)
+        _template_cache[key] = resolve_template(schema["questions"], scaffold, fmt)
     return _template_cache[key]
 
 
@@ -325,7 +346,7 @@ def question_groups(schema):
     groups, group = [], []
     for q in qs:
         trial = group + [q]
-        rows = len(SCAFFOLD) + len(enc(answer_text(trial, [0] * len(trial)))) + 1
+        rows = len(SCAFFOLD) + len(enc(answer_text(trial, [0] * len(trial), schema.get("format", "lines")))) + 1
         if rows > limit and group:
             groups.append(group)
             group = [q]
@@ -367,11 +388,11 @@ def decide(schema, state_content, seed):
         parts = []
         for k, group in enumerate(groups):
             sub = dict(schema, questions=group)
-            prefix = base_ids + enc("".join(line + "\n" for line in lines)) if lines else None
+            prefix = base_ids + enc(FORMATS[schema["format"]][0].join(lines)) if lines else None
             body, rows = decide_group(sub, sys_text, state_content, seed + 104729 * k, prefix=prefix)
             parts.append((body, rows))
             chosen = [q["labels"].index(body["answers"][q["id"]]["label"]) for q in group]
-            lines.append(answer_text(group, chosen))
+            lines.append(answer_text(group, chosen, schema["format"]))
     else:
         with ThreadPoolExecutor(max_workers=len(groups)) as ex:
             parts = list(ex.map(one, enumerate(groups)))
