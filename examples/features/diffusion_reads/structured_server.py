@@ -170,6 +170,11 @@ def build_canvas(template, slots, seed):
     return canvas
 
 
+def label_id_union(slots):
+    ids = sorted({i for s in slots for i in s["label_ids"]})
+    return ids[:128]  # vLLM's cap per request; a schema needs far fewer
+
+
 def upstream_chat(body, timeout=600):
     req = urllib.request.Request(ARGS.upstream.rstrip("/") + "/v1/chat/completions", data=json.dumps(body).encode(),
                                  headers={"content-type": "application/json"})
@@ -183,6 +188,10 @@ def one_read(schema, template, slots, sys_text, state_text, seed):
         "max_tokens": len(template) + 1,
         "logprobs": True,
         "top_logprobs": TOPK,
+        # Exact logprobs for every label at every position. With a long
+        # option list most labels never rank in the top-k, and the model's
+        # mass sits on tokens that spell the option name instead.
+        "logprob_token_ids": label_id_union(slots),
         "return_tokens_as_token_ids": True,
         "chat_template_kwargs": {"enable_thinking": False},
         "vllm_xargs": {"diffusion_seed_canvas": build_canvas(template, slots, seed), "diffusion_max_steps": schema["steps"], "diffusion_read_only": True},

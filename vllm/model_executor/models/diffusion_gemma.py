@@ -1128,6 +1128,7 @@ class DiffusionSampler:
         tp_group_name: str = "",
     ):
         self.sampling_states = sampler.sampling_states
+        self.logprob_token_ids_state = sampler.logprob_token_ids_state
         self.req_states = sampler.req_states
         self.logits_mode = sampler.logprobs_mode in ("raw_logits", "processed_logits")
         # Self-conditioning soft embed = probs @ embed_weight * normalizer,
@@ -1184,6 +1185,7 @@ class DiffusionSampler:
         # that was aborted between its converging denoise and commit steps.
         self._pending_logprobs.pop(req_idx, None)
         self.sampling_states.add_request(req_idx, sampling_params)
+        self.logprob_token_ids_state.add_request(req_idx, sampling_params)
         extra = getattr(sampling_params, "extra_args", None) or {}
         states = self.diffusion_states
         cap = extra.get("diffusion_max_steps")
@@ -1205,6 +1207,7 @@ class DiffusionSampler:
 
     def apply_staged_writes(self) -> None:
         self.sampling_states.apply_staged_writes()
+        self.logprob_token_ids_state.apply_staged_writes()
 
     @property
     def penalties_state(self):
@@ -1392,6 +1395,11 @@ class DiffusionSampler:
         slots_np = input_batch.idx_mapping_np[:num_reqs]
         is_decode_np = per_req_nlogits_np > 0
         max_num_logprobs = self.sampling_states.max_num_logprobs(slots_np)
+        # Requests may ask for specific token ids' logprobs instead of, or as
+        # well as, a top-k.
+        max_token_ids = self.logprob_token_ids_state.max_num_token_ids(slots_np)
+        want_logprobs = max_num_logprobs >= 0 or max_token_ids > 0
+        num_logprobs = max(max_num_logprobs, 0)
 
         # Sample over the [num_decode * CL, vocab] logits. The fp32 pipeline in
         # _compiled_sample_step keeps several live [group * CL, vocab] copies, so
@@ -1454,7 +1462,7 @@ class DiffusionSampler:
 
             # Logprobs for denoise steps that just converged (is_encoder_phase
             # flipped False→True), stashed per tile so `scaled` is freed each tile.
-            if max_num_logprobs >= 0:
+            if want_logprobs:
                 converged_mask = states.is_encoder_phase[tile_slots]
                 just_converged = converged_mask & ~is_committing[tile]
                 if just_converged.any():
@@ -1477,10 +1485,21 @@ class DiffusionSampler:
                                 tile_rows = slice(start_req * CL, end_req * CL)
                                 raw_flat = logits[tile_rows].float()
                             src = raw_flat
+                        per_req_ids = max_token_ids > 0
                         self._pending_logprobs[slot] = compute_topk_scores(
                             src[pos : pos + k_i],
-                            max_num_logprobs,
+                            num_logprobs,
                             argmax_tokens[local_idx][:k_i],
+                            logprob_token_ids_state=(
+                                self.logprob_token_ids_state if per_req_ids else None
+                            ),
+                            # every row of this stash belongs to one slot
+                            expanded_idx_mapping=(
+                                torch.full((k_i,), slot, dtype=torch.int32, device=device)
+                                if per_req_ids
+                                else None
+                            ),
+                            max_per_req_token_ids=max_token_ids,
                             logits_mode=self.logits_mode,
                         )
 
@@ -1507,7 +1526,7 @@ class DiffusionSampler:
         # stashed logprobs and attach to SamplerOutput.
         logprobs_tensors = None
         if (
-            max_num_logprobs >= 0
+            want_logprobs
             and (emit_now or bool(is_committing.any()))
             and self._pending_logprobs
         ):
