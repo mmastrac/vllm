@@ -19,6 +19,10 @@ Schema (system message):
    "samples": "auto" | N, "auto_threshold": 0.1, "auto_max": 4,
    "steps": 1}
 
+A schema whose answer lines do not fit the canvas is split into chunks
+that run together, each with its own question list ("chunk_rows" sets the
+rows per chunk, "ask" picks a subset of question ids for one read).
+
 Serve the model with a canvas that holds the answer template, for example:
   vllm serve google/diffusiongemma-26B-A4B-it \
       --diffusion-config '{"canvas_length": 64}' --max-logprobs 32 --enable-prefix-caching
@@ -27,6 +31,7 @@ then run this in front of it:
       --tokenizer google/diffusiongemma-26B-A4B-it --canvas 64 --port 8011
 """
 import argparse, json, math, random, threading, time, urllib.error, urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from transformers import AutoTokenizer
@@ -88,11 +93,22 @@ def parse_schema(value):
         policy = {"mode": "fixed", "n": min(samples, 32)}
     else:
         raise SchemaError("schema: samples must be a positive count or \"auto\"")
+    ask = value.get("ask")
+    if ask is not None:
+        if not isinstance(ask, list) or not ask or any(a not in seen for a in ask):
+            raise SchemaError("schema: ask must list question ids from this schema")
+    chunk_rows = value.get("chunk_rows")
+    if chunk_rows is not None and (not isinstance(chunk_rows, int) or chunk_rows < 8):
+        raise SchemaError("schema: chunk_rows must be an integer of at least 8")
+    chunk_prompt = value.get("chunk_prompt", "own")
+    if chunk_prompt not in ("shared", "own"):
+        raise SchemaError("schema: chunk_prompt must be \"shared\" or \"own\"")
     return {"questions": qs, "instructions": value.get("instructions"), "policy": policy,
-            "steps": max(1, min(int(value.get("steps", 1)), 8))}
+            "steps": max(1, min(int(value.get("steps", 1)), 8)),
+            "ask": ask, "chunk_rows": chunk_rows, "chunk_prompt": chunk_prompt}
 
 
-def system_text(schema):
+def system_text(schema, chunked=False):
     s = ("Answer a fixed set of questions about the state the user provides. "
          "Each question lists its allowed answers; reply with exactly one label per question.\n")
     if schema.get("instructions"):
@@ -107,6 +123,8 @@ def system_text(schema):
             else:
                 s += f"  {label}: {name}\n"
     s += '\nReply with one line per question, in this order, formatted as "id: label".'
+    if chunked:
+        s += " A reply may cover only some of the questions; answer every line that is present."
     return s
 
 
@@ -126,6 +144,8 @@ def resolve_template(qs):
     base = SCAFFOLD + enc(answer_text(qs, base_labels))
     if len(base) + 1 > CANVAS_LEN:
         raise SchemaError(f"answer template is {len(base)} tokens; the canvas holds {CANVAS_LEN - 1}")
+    if len(qs) == 1 and len(base) + 1 > CANVAS_LEN:
+        raise SchemaError(f"question {qs[0]['id']!r} alone needs {len(base) + 1} canvas rows")
     slots = []
     for qi, q in enumerate(qs):
         pos = None
@@ -188,10 +208,10 @@ def upstream_chat(body, timeout=600):
     return json.load(urllib.request.urlopen(req, timeout=timeout))
 
 
-def one_read(schema, template, slots, sys_text, state_text, seed):
+def one_read(schema, template, slots, sys_text, state_content, seed):
     body = {
         "model": ARGS.model,
-        "messages": [{"role": "system", "content": sys_text}, {"role": "user", "content": state_text}],
+        "messages": [{"role": "system", "content": sys_text}, {"role": "user", "content": state_content}],
         "max_tokens": len(template) + 1,
         "logprobs": True,
         "top_logprobs": TOPK,
@@ -226,13 +246,13 @@ def one_read(schema, template, slots, sys_text, state_text, seed):
     return out, d.get("usage", {})
 
 
-def read_many(schema, template, slots, sys_text, state_text, seed, n):
+def read_many(schema, template, slots, sys_text, state_content, seed, n):
     results = [None] * n
     errors = [None] * n
 
     def run(k):
         try:
-            results[k], _ = one_read(schema, template, slots, sys_text, state_text, seed + k * 7919)
+            results[k], _ = one_read(schema, template, slots, sys_text, state_content, seed + k * 7919)
         except Exception as e:  # surfaced as one failed request below
             errors[k] = e
 
@@ -247,21 +267,85 @@ def read_many(schema, template, slots, sys_text, state_text, seed, n):
     return results
 
 
-def decide(schema, state_text, seed):
+def question_groups(schema):
+    """The questions of one read each. ``ask`` picks a subset; otherwise the
+    questions are split, in order, into the fewest groups whose answer
+    templates fit ``chunk_rows`` (the canvas by default)."""
+    qs = schema["questions"]
+    if schema.get("ask"):
+        wanted = set(schema["ask"])
+        return [[q for q in qs if q["id"] in wanted]]
+    limit = schema.get("chunk_rows") or CANVAS_LEN
+    groups, group = [], []
+    for q in qs:
+        trial = group + [q]
+        rows = len(SCAFFOLD) + len(enc(answer_text(trial, [0] * len(trial)))) + 1
+        if rows > limit and group:
+            groups.append(group)
+            group = [q]
+        else:
+            group = trial
+    groups.append(group)
+    return groups
+
+
+def decide(schema, state_content, seed):
+    """One decision, as one read set or several chunked ones run together."""
+    groups = question_groups(schema)
+    chunked = len(groups) > 1
+    started = time.time()
+    if not chunked:
+        body, rows = decide_group(dict(schema, questions=groups[0]), system_text(schema), state_content, seed)
+        return body, rows
+    # Each chunk lists its own questions by default: a chunk answering a
+    # subset of a longer list loses alignment and confidence (measured on
+    # per-word PII: 3 of 42 decisions flipped, none with own lists).
+    shared = schema["chunk_prompt"] == "shared"
+    sys_shared = system_text(schema, chunked=True)
+
+    def one(k_group):
+        k, group = k_group
+        sub = dict(schema, questions=group)
+        sys_text = sys_shared if shared else system_text(sub)
+        return decide_group(sub, sys_text, state_content, seed + 104729 * k)
+
+    with ThreadPoolExecutor(max_workers=len(groups)) as ex:
+        parts = list(ex.map(one, enumerate(groups)))
+    answers, diag_q = {}, {}
+    for body, _ in parts:
+        answers.update(body["answers"])
+        diag_q.update(body["diagnostics"]["questions"])
+    return {
+        "answers": answers,
+        "diagnostics": {
+            "steps": schema["steps"],
+            "chunks": [[q["id"] for q in g] for g in groups],
+            "chunk_prompt": schema["chunk_prompt"],
+            "samples": {"n": [b["diagnostics"]["samples"]["n"] for b, _ in parts],
+                        "tops": [b["diagnostics"]["samples"]["tops"] for b, _ in parts],
+                        "policy": [b["diagnostics"]["samples"]["policy"] for b, _ in parts]},
+            "timing": {"total_ms": (time.time() - started) * 1e3,
+                       "reads": sum(b["diagnostics"]["timing"]["reads"] for b, _ in parts)},
+            "questions": diag_q,
+            "engine": "vllm",
+        },
+    }, sum(rows for _, rows in parts)
+
+
+def decide_group(schema, sys_text, state_content, seed):
     template, slots = template_for(schema)
-    sys_text = system_text(schema)
     started = time.time()
     policy = schema["policy"]
     if policy["mode"] == "fixed":
-        reads = read_many(schema, template, slots, sys_text, state_text, seed, policy["n"])
+        reads = read_many(schema, template, slots, sys_text, state_content, seed, policy["n"])
         extended = None
         first_entropy = None
     else:
-        reads = read_many(schema, template, slots, sys_text, state_text, seed, 1)
+        reads = read_many(schema, template, slots, sys_text, state_content, seed, 1)
         first_entropy = {q["id"]: r["entropy"] for q, r in zip(schema["questions"], reads[0])}
         extended = max(first_entropy.values()) > policy["threshold"] and policy["max"] > 1
         if extended:
-            reads += read_many(schema, template, slots, sys_text, state_text, seed + 1, policy["max"] - 1)
+            reads += read_many(schema, template, slots, sys_text, state_content, seed + 1, policy["max"] - 1)
     elapsed_ms = (time.time() - started) * 1e3
 
     answers = {}
@@ -342,12 +426,19 @@ class Handler(BaseHTTPRequestHandler):
         try:
             schema_value = json.loads(message_text(msgs[0]))
             schema = parse_schema(schema_value)
-            state = message_text(msgs[1]).strip()
-            json.loads(state)
+            content = msgs[1].get("content", "")
+            has_image = isinstance(content, list) and any(
+                isinstance(p, dict) and p.get("type") in ("image_url", "image") for p in content)
+            if has_image:
+                # image parts pass through to vLLM as they are; any text part is context
+                state = content
+            else:
+                state = message_text(msgs[1]).strip()
+                json.loads(state)
         except SchemaError as e:
             return self._json(400, {"error": {"message": str(e), "type": "invalid_request_error"}})
         except Exception as e:
-            return self._json(400, {"error": {"message": f"system must be a JSON question schema and user must be JSON state: {e}", "type": "invalid_request_error"}})
+            return self._json(400, {"error": {"message": f"system must be a JSON question schema and user must be JSON state or image parts: {e}", "type": "invalid_request_error"}})
         seed = int(req.get("seed", 42))
         try:
             body, completion_tokens = decide(schema, state, seed)
