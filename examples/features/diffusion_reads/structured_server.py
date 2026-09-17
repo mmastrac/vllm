@@ -44,7 +44,8 @@ VOCAB = 262144
 TURN_CLOSE = 106
 PAD = 0
 TOPK = 20
-SCAFFOLD = None  # the empty thought block the chat template leaves to the model
+SCAFFOLD_TEXT = "<|channel>thought\n<channel|>"  # the empty thought block the chat template leaves to the model
+SCAFFOLD = None
 
 
 # ----------------------------------------------------------------------------
@@ -103,9 +104,10 @@ def parse_schema(value):
     chunk_prompt = value.get("chunk_prompt", "own")
     if chunk_prompt not in ("shared", "own"):
         raise SchemaError("schema: chunk_prompt must be \"shared\" or \"own\"")
+    sequential = bool(value.get("sequential", False))
     return {"questions": qs, "instructions": value.get("instructions"), "policy": policy,
             "steps": max(1, min(int(value.get("steps", 1)), 8)),
-            "ask": ask, "chunk_rows": chunk_rows, "chunk_prompt": chunk_prompt}
+            "ask": ask, "chunk_rows": chunk_rows, "chunk_prompt": chunk_prompt, "sequential": sequential}
 
 
 def system_text(schema, chunked=False):
@@ -136,12 +138,14 @@ def enc(text):
     return TOK.encode(text, add_special_tokens=False)
 
 
-def resolve_template(qs):
+def resolve_template(qs, scaffold=True):
     """Tokenize the answer template and find each question's slot. Every label
     must change exactly one token, at the same position for all of a question's
-    labels, or the schema is refused."""
+    labels, or the schema is refused. ``scaffold`` is False for a continuation
+    whose thought block and earlier answer lines are already in the prompt."""
+    head = SCAFFOLD if scaffold else []
     base_labels = [0] * len(qs)
-    base = SCAFFOLD + enc(answer_text(qs, base_labels))
+    base = head + enc(answer_text(qs, base_labels))
     if len(base) + 1 > CANVAS_LEN:
         raise SchemaError(f"answer template is {len(base)} tokens; the canvas holds {CANVAS_LEN - 1}")
     if len(qs) == 1 and len(base) + 1 > CANVAS_LEN:
@@ -153,7 +157,7 @@ def resolve_template(qs):
         for li in range(1, len(q["labels"])):
             labels = list(base_labels)
             labels[qi] = li
-            e = SCAFFOLD + enc(answer_text(qs, labels))
+            e = head + enc(answer_text(qs, labels))
             if len(e) != len(base):
                 raise SchemaError(f"question {q['id']!r}: label {q['labels'][li]!r} is not a single token")
             diffs = [i for i in range(len(e)) if e[i] != base[i]]
@@ -171,10 +175,10 @@ def resolve_template(qs):
 _template_cache = {}
 
 
-def template_for(schema):
-    key = json.dumps([(q["id"], q["labels"]) for q in schema["questions"]])
+def template_for(schema, scaffold=True):
+    key = json.dumps([scaffold] + [(q["id"], q["labels"]) for q in schema["questions"]])
     if key not in _template_cache:
-        _template_cache[key] = resolve_template(schema["questions"])
+        _template_cache[key] = resolve_template(schema["questions"], scaffold)
     return _template_cache[key]
 
 
@@ -208,10 +212,22 @@ def upstream_chat(body, timeout=600):
     return json.load(urllib.request.urlopen(req, timeout=timeout))
 
 
-def one_read(schema, template, slots, sys_text, state_content, seed):
+def chat_prompt_ids(sys_text, state_text):
+    """The prompt the chat endpoint would build, as token ids, ending after
+    the model turn marker. Text states only."""
+    messages = [{"role": "system", "content": sys_text}, {"role": "user", "content": state_text}]
+    out = TOK.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, enable_thinking=False)
+    ids = out["input_ids"] if hasattr(out, "keys") else out  # newer transformers return a dict
+    return [int(t) for t in ids]
+
+
+def one_read(schema, template, slots, sys_text, state_content, seed, prefix=None):
+    if prefix is not None:
+        return one_read_continuation(schema, template, slots, prefix, seed)
+    messages = [{"role": "system", "content": sys_text}, {"role": "user", "content": state_content}]
     body = {
         "model": ARGS.model,
-        "messages": [{"role": "system", "content": sys_text}, {"role": "user", "content": state_content}],
+        "messages": messages,
         "max_tokens": len(template) + 1,
         "logprobs": True,
         "top_logprobs": TOPK,
@@ -229,30 +245,60 @@ def one_read(schema, template, slots, sys_text, state_content, seed):
     out = []
     for q, s in zip(schema["questions"], slots):
         top = {int(t["token"].split(":")[1]): t["logprob"] for t in content[s["pos"]]["top_logprobs"]}
-        floor = min(top.values()) - 5.0
-        lp_t = [top.get(i, floor) for i in s["label_ids"]]
-        # Read-only logprobs are at temperature 1, so the label softmax uses
-        # them directly.
-        mx = max(lp_t)
-        ex = [math.exp(x - mx) for x in lp_t]
-        probs = [e / sum(ex) for e in ex]
-        top_p = [math.exp(v) for v in top.values()]
-        out.append({
-            "probs": probs,
-            "label_mass": sum(math.exp(x) for x in lp_t),
-            "entropy": -sum(p * math.log(p) for p in top_p if p > 0),
-            "argmax_is_label": max(top, key=top.get) in s["label_ids"],
-        })
+        out.append(slot_distribution(top, s["label_ids"]))
     return out, d.get("usage", {})
 
 
-def read_many(schema, template, slots, sys_text, state_content, seed, n):
+def slot_distribution(top, label_ids):
+    """Label probabilities at one slot from the returned logprobs: every
+    label's own value plus the argmax token. Read-only logprobs are at
+    temperature 1, so the label softmax uses them directly. The entropy is
+    over that returned set."""
+    floor = min(top.values()) - 5.0
+    lp_t = [top.get(i, floor) for i in label_ids]
+    mx = max(lp_t)
+    ex = [math.exp(x - mx) for x in lp_t]
+    probs = [e / sum(ex) for e in ex]
+    top_p = [math.exp(v) for v in top.values()]
+    return {
+        "probs": probs,
+        "label_mass": sum(math.exp(x) for x in lp_t),
+        "entropy": -sum(p * math.log(p) for p in top_p if p > 0),
+        "argmax_is_label": max(top, key=top.get) in label_ids,
+    }
+
+
+def one_read_continuation(schema, template, slots, prompt_ids, seed):
+    """A read whose prompt already holds the thought scaffold and earlier
+    answer lines, sent as token ids so the chat template cannot alter it."""
+    body = {
+        "model": ARGS.model,
+        "prompt": prompt_ids,
+        "max_tokens": len(template) + 1,
+        "logprobs": TOPK,
+        "logprob_token_ids": label_id_union(slots),
+        "return_tokens_as_token_ids": True,
+        "vllm_xargs": {"diffusion_seed_canvas": build_canvas(template, slots, seed), "diffusion_canvas_length": canvas_width(template),
+                       "diffusion_max_steps": schema["steps"], "diffusion_read_only": True},
+    }
+    req = urllib.request.Request(ARGS.upstream.rstrip("/") + "/v1/completions", data=json.dumps(body).encode(),
+                                 headers={"content-type": "application/json"})
+    d = json.load(urllib.request.urlopen(req, timeout=600))
+    rows = d["choices"][0]["logprobs"]["top_logprobs"]
+    out = []
+    for q, sl in zip(schema["questions"], slots):
+        top = {int(k.split(":")[1]): v for k, v in rows[sl["pos"]].items()}
+        out.append(slot_distribution(top, sl["label_ids"]))
+    return out, d.get("usage", {})
+
+
+def read_many(schema, template, slots, sys_text, state_content, seed, n, prefix=None):
     results = [None] * n
     errors = [None] * n
 
     def run(k):
         try:
-            results[k], _ = one_read(schema, template, slots, sys_text, state_content, seed + k * 7919)
+            results[k], _ = one_read(schema, template, slots, sys_text, state_content, seed + k * 7919, prefix)
         except Exception as e:  # surfaced as one failed request below
             errors[k] = e
 
@@ -309,8 +355,26 @@ def decide(schema, state_content, seed):
         sys_text = sys_shared if shared else system_text(sub)
         return decide_group(sub, sys_text, state_content, seed + 104729 * k)
 
-    with ThreadPoolExecutor(max_workers=len(groups)) as ex:
-        parts = list(ex.map(one, enumerate(groups)))
+    if schema["sequential"]:
+        # Chunks continue one answer in order under the full question list.
+        # Each chunk's argmax lines are prefilled before the next, so later
+        # answers condition on earlier ones (conditionals, not marginals).
+        sys_text = system_text(schema)
+        if not isinstance(state_content, str):
+            raise SchemaError("sequential chunks need a text state (images go through the chat endpoint)")
+        base_ids = chat_prompt_ids(sys_text, state_content) + SCAFFOLD
+        lines = []
+        parts = []
+        for k, group in enumerate(groups):
+            sub = dict(schema, questions=group)
+            prefix = base_ids + enc("".join(line + "\n" for line in lines)) if lines else None
+            body, rows = decide_group(sub, sys_text, state_content, seed + 104729 * k, prefix=prefix)
+            parts.append((body, rows))
+            chosen = [q["labels"].index(body["answers"][q["id"]]["label"]) for q in group]
+            lines.append(answer_text(group, chosen))
+    else:
+        with ThreadPoolExecutor(max_workers=len(groups)) as ex:
+            parts = list(ex.map(one, enumerate(groups)))
     answers, diag_q = {}, {}
     for body, _ in parts:
         answers.update(body["answers"])
@@ -320,7 +384,8 @@ def decide(schema, state_content, seed):
         "diagnostics": {
             "steps": schema["steps"],
             "chunks": [[q["id"] for q in g] for g in groups],
-            "chunk_prompt": schema["chunk_prompt"],
+            "chunk_prompt": "full" if schema["sequential"] else schema["chunk_prompt"],
+            "sequential": schema["sequential"],
             "samples": {"n": [b["diagnostics"]["samples"]["n"] for b, _ in parts],
                         "tops": [b["diagnostics"]["samples"]["tops"] for b, _ in parts],
                         "policy": [b["diagnostics"]["samples"]["policy"] for b, _ in parts]},
@@ -332,20 +397,20 @@ def decide(schema, state_content, seed):
     }, sum(rows for _, rows in parts)
 
 
-def decide_group(schema, sys_text, state_content, seed):
-    template, slots = template_for(schema)
+def decide_group(schema, sys_text, state_content, seed, prefix=None):
+    template, slots = template_for(schema, scaffold=prefix is None)
     started = time.time()
     policy = schema["policy"]
     if policy["mode"] == "fixed":
-        reads = read_many(schema, template, slots, sys_text, state_content, seed, policy["n"])
+        reads = read_many(schema, template, slots, sys_text, state_content, seed, policy["n"], prefix)
         extended = None
         first_entropy = None
     else:
-        reads = read_many(schema, template, slots, sys_text, state_content, seed, 1)
+        reads = read_many(schema, template, slots, sys_text, state_content, seed, 1, prefix)
         first_entropy = {q["id"]: r["entropy"] for q, r in zip(schema["questions"], reads[0])}
         extended = max(first_entropy.values()) > policy["threshold"] and policy["max"] > 1
         if extended:
-            reads += read_many(schema, template, slots, sys_text, state_content, seed + 1, policy["max"] - 1)
+            reads += read_many(schema, template, slots, sys_text, state_content, seed + 1, policy["max"] - 1, prefix)
     elapsed_ms = (time.time() - started) * 1e3
 
     answers = {}
@@ -475,7 +540,7 @@ def main():
     CANVAS_LEN = ARGS.canvas
     CANVAS_STEP = ARGS.canvas_step
     TOK = AutoTokenizer.from_pretrained(ARGS.tokenizer)
-    SCAFFOLD = enc("<|channel>thought\n<channel|>")
+    SCAFFOLD = enc(SCAFFOLD_TEXT)
     print(f"structured server on {ARGS.host}:{ARGS.port} -> {ARGS.upstream} (canvas {CANVAS_LEN})", flush=True)
     ThreadingHTTPServer((ARGS.host, ARGS.port), Handler).serve_forever()
 
