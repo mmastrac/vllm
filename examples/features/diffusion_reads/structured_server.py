@@ -33,7 +33,8 @@ from transformers import AutoTokenizer
 
 ARGS = None
 TOK = None
-CANVAS_LEN = 64
+CANVAS_LEN = 64      # the served canvas; a request may run narrower
+CANVAS_STEP = 16     # request widths are multiples of this
 VOCAB = 262144
 TURN_CLOSE = 106
 PAD = 0
@@ -161,10 +162,16 @@ def template_for(schema):
 # Reads
 # ----------------------------------------------------------------------------
 
+def canvas_width(template):
+    """Smallest multiple of CANVAS_STEP that holds the template and the turn close."""
+    need = len(template) + 1
+    return min(CANVAS_LEN, -(-need // CANVAS_STEP) * CANVAS_STEP)
+
+
 def build_canvas(template, slots, seed):
     rng = random.Random(seed)
     canvas = list(template) + [TURN_CLOSE]
-    canvas += [PAD] * (CANVAS_LEN - len(canvas))
+    canvas += [PAD] * (canvas_width(template) - len(canvas))
     for s in slots:
         canvas[s["pos"]] = rng.randrange(VOCAB)
     return canvas
@@ -194,7 +201,8 @@ def one_read(schema, template, slots, sys_text, state_text, seed):
         "logprob_token_ids": label_id_union(slots),
         "return_tokens_as_token_ids": True,
         "chat_template_kwargs": {"enable_thinking": False},
-        "vllm_xargs": {"diffusion_seed_canvas": build_canvas(template, slots, seed), "diffusion_max_steps": schema["steps"], "diffusion_read_only": True},
+        "vllm_xargs": {"diffusion_seed_canvas": build_canvas(template, slots, seed), "diffusion_canvas_length": canvas_width(template),
+                       "diffusion_max_steps": schema["steps"], "diffusion_read_only": True},
     }
     d = upstream_chat(body)
     content = d["choices"][0]["logprobs"]["content"]
@@ -363,16 +371,18 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global ARGS, TOK, SCAFFOLD, CANVAS_LEN
+    global ARGS, TOK, SCAFFOLD, CANVAS_LEN, CANVAS_STEP
     p = argparse.ArgumentParser()
     p.add_argument("--upstream", default="http://127.0.0.1:8010")
     p.add_argument("--model", default="dgemma")
     p.add_argument("--tokenizer", default="/models/dgemma", help="HF id or local path")
-    p.add_argument("--canvas", type=int, default=64)
+    p.add_argument("--canvas", type=int, default=64, help="the served canvas length")
+    p.add_argument("--canvas-step", type=int, default=16, help="request widths round up to a multiple of this")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8011)
     ARGS = p.parse_args()
     CANVAS_LEN = ARGS.canvas
+    CANVAS_STEP = ARGS.canvas_step
     TOK = AutoTokenizer.from_pretrained(ARGS.tokenizer)
     SCAFFOLD = enc("<|channel>thought\n<channel|>")
     print(f"structured server on {ARGS.host}:{ARGS.port} -> {ARGS.upstream} (canvas {CANVAS_LEN})", flush=True)

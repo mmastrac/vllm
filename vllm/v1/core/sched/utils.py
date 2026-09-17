@@ -7,6 +7,14 @@ from vllm.sampling_params import RepetitionDetectionParams
 from vllm.v1.request import Request, RequestStatus
 
 
+def diffusion_canvas_width(request: Request, canvas_length: int) -> int:
+    """The canvas width a diffusion request asked for, else the served one."""
+    params = request.sampling_params
+    extra = params.extra_args if params is not None else None
+    width = extra.get("diffusion_canvas_length") if extra else None
+    return int(width) if width else canvas_length
+
+
 def _has_repeating_pattern(
     token_ids: Sequence[int],
     pattern_len: int,

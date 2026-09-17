@@ -4,6 +4,7 @@
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.sched.utils import diffusion_canvas_width
 from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
@@ -15,6 +16,13 @@ class AsyncScheduler(Scheduler):
         # reusable read-only placeholder list for speculative decoding.
         self._spec_token_placeholders: list[int] = [-1] * self.num_spec_tokens
         self.pp_size = self.parallel_config.pipeline_parallel_size
+
+    def _spec_width(self, request: Request) -> int:
+        """Spec tokens to schedule for the request next step."""
+        full = len(self._spec_token_placeholders)
+        if self.num_sampled_tokens_per_step != 0:
+            return full
+        return min(full, diffusion_canvas_width(request, full))
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         super()._update_after_schedule(scheduler_output)
@@ -41,7 +49,8 @@ class AsyncScheduler(Scheduler):
             )
             # Add placeholders for the new draft/spec tokens.
             # We will update the actual spec token ids in the worker process.
-            request.spec_token_ids = self._spec_token_placeholders
+            # A diffusion request may run a narrower canvas than the served one.
+            request.spec_token_ids = self._spec_token_placeholders[: self._spec_width(request)]
 
             if self.use_v2_model_runner:
                 # Set the next step index in which this request is eligible to be

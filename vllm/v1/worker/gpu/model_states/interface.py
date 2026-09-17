@@ -230,5 +230,10 @@ class ModelState(ABC):
         return None
 
     num_new_sampled_tokens_per_step: int = 1
+
+    def num_draft_tokens_per_req(self, input_batch: Any) -> Any:
+        """Draft tokens each request in the batch carries into its next step,
+        as an int array, or None when every request carries the buffer width."""
+        return None
     """New tokens sampled on each decode step 
     (excluding accepted draft tokens, a.k.a num bonus tokens)."""

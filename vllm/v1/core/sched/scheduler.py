@@ -51,7 +51,11 @@ from vllm.v1.core.sched.request_queue import (
     SchedulingPolicy,
     create_request_queue,
 )
-from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.core.sched.utils import (
+    check_stop,
+    diffusion_canvas_width,
+    remove_all,
+)
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
@@ -2134,8 +2138,9 @@ class Scheduler(SchedulerInterface):
         diffusion_config = self.vllm_config.diffusion_config
         if not steps or diffusion_config is None:
             return False
+        width = diffusion_canvas_width(request, diffusion_config.canvas_length)
         # Each in-flight denoise step holds one canvas of placeholders.
-        return request.num_output_placeholders >= steps * diffusion_config.canvas_length
+        return request.num_output_placeholders >= steps * width
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int], is_stale: bool = False
