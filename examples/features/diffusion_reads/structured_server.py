@@ -2,11 +2,30 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Structured decisions in front of a vLLM DiffusionGemma server.
 
-POST /v1/chat/completions with a system message that is the question schema
-and a user message that is the state. The reply's `content` is the JSON
-answer set: one calibrated distribution per question, from a single denoise
-step over a seeded canvas, averaged over a few noise draws. The canvas,
-tokenizer, slot resolution, noise draws and averaging stay behind this server.
+POST /v1/systemone takes Jev's request: {"model", "state", "questions"} with
+questions a map of id -> {"type": "noul" | "choice" | "score",
+"instructions", "criteria"} (noul: optional {"true", "false"} descriptions;
+choice: option name -> description or null; score: ordered list of levels)
+and answers in Jev's shape: noul {"noul": p}, choice {"choice",
+"probabilities", "confidence"}, score {"score", "legend", "probabilities",
+"confidence"}, with this server's diagnostics alongside. The schema keys
+below may be added to the request body as extensions ("samples", "think",
+"chunk_rows", "sequential", "ask", "steps", "instructions"). Images go
+ahead of the state: as multipart/form-data with the JSON body in a part
+named "request" and each image as a file part, or as an "images" array of
+data URLs in the JSON body.
+
+POST /v1/chat/completions is the same decision as an OpenAI-shaped call: a
+system message that is the schema JSON below and a user message that is
+the state; the reply's `content` is the JSON answer set.
+
+With TEST_PAGE=1 in the environment, GET / serves playground.html: a form
+for the request JSON with an image file or webcam frames attached.
+
+Each answer is one calibrated distribution per question, from a single
+denoise step over a seeded canvas, averaged over a few noise draws. The
+canvas, tokenizer, slot resolution, noise draws and averaging stay behind
+this server.
 
 Schema (system message):
   {"questions": [
@@ -35,7 +54,7 @@ then run this in front of it:
   python structured_server.py --upstream http://127.0.0.1:8000 \
       --tokenizer google/diffusiongemma-26B-A4B-it --canvas 64 --port 8011
 """
-import argparse, json, math, random, threading, time, urllib.error, urllib.request
+import argparse, base64, json, math, os, random, threading, time, urllib.error, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -43,6 +62,8 @@ from transformers import AutoTokenizer
 
 ARGS = None
 TOK = None
+TEST_PAGE = os.environ.get("TEST_PAGE", "") == "1"  # serve the playground at /
+PLAYGROUND = os.path.join(os.path.dirname(os.path.abspath(__file__)), "playground.html")
 CANVAS_LEN = 64      # the served canvas; a request may run narrower
 CANVAS_STEP = 16     # request widths are multiples of this
 VOCAB = 262144
@@ -78,7 +99,8 @@ def parse_schema(value):
         kind = q.get("type")
         if kind in ("noul", "bool", "boolean"):
             kind = "noul"
-            choices = [("yes", None), ("no", None)]
+            crit = q.get("criteria") or {}
+            choices = [("yes", crit.get("true")), ("no", crit.get("false"))]
             labels = ["yes", "no"]
         elif kind == "choice":
             opts = q.get("options") or []
@@ -144,7 +166,7 @@ def system_text(schema, chunked=False):
         s += f"\nQuestion {q['id']}: {q['instructions'].strip()}\n"
         for (name, desc), label in zip(q["choices"], q["labels"]):
             if q["type"] == "noul":
-                s += f"  {label}\n"
+                s += f"  {label}: {str(desc).strip()}\n" if desc else f"  {label}\n"
             elif desc:
                 s += f"  {label}: {name} ({str(desc).strip()})\n"
             else:
@@ -354,10 +376,11 @@ def one_read_continuation(schema, template, slots, prompt_ids, seed):
 def read_many(schema, template, slots, sys_text, state_content, seed, n, prefix=None):
     results = [None] * n
     errors = [None] * n
+    usages = [None] * n
 
     def run(k):
         try:
-            results[k], _ = one_read(schema, template, slots, sys_text, state_content, seed + k * 7919, prefix)
+            results[k], usages[k] = one_read(schema, template, slots, sys_text, state_content, seed + k * 7919, prefix)
         except Exception as e:  # surfaced as one failed request below
             errors[k] = e
 
@@ -369,7 +392,7 @@ def read_many(schema, template, slots, sys_text, state_content, seed, n, prefix=
     for e in errors:
         if e is not None:
             raise e
-    return results
+    return results, usages
 
 
 def question_groups(schema):
@@ -461,6 +484,7 @@ def decide(schema, state_content, seed):
                         "policy": [b["diagnostics"]["samples"]["policy"] for b, _ in parts]},
             "timing": {"total_ms": (time.time() - started) * 1e3,
                        "reads": sum(b["diagnostics"]["timing"]["reads"] for b, _ in parts)},
+            "prompt_tokens": max((b["diagnostics"].get("prompt_tokens") or 0) for b, _ in parts) or None,
             "questions": diag_q,
             "engine": "vllm",
         },
@@ -477,15 +501,18 @@ def decide_group(schema, sys_text, state_content, seed, prefix=None, lead=""):
     template, slots = template_for(schema, SCAFFOLD if prefix is None else [], lead)
     policy = schema["policy"]
     if policy["mode"] == "fixed":
-        reads = read_many(schema, template, slots, sys_text, state_content, seed, policy["n"], prefix)
+        reads, usages = read_many(schema, template, slots, sys_text, state_content, seed, policy["n"], prefix)
         extended = None
         first_entropy = None
     else:
-        reads = read_many(schema, template, slots, sys_text, state_content, seed, 1, prefix)
+        reads, usages = read_many(schema, template, slots, sys_text, state_content, seed, 1, prefix)
         first_entropy = {q["id"]: r["entropy"] for q, r in zip(schema["questions"], reads[0])}
         extended = max(first_entropy.values()) > policy["threshold"] and policy["max"] > 1
         if extended:
-            reads += read_many(schema, template, slots, sys_text, state_content, seed + 1, policy["max"] - 1, prefix)
+            more, more_usages = read_many(schema, template, slots, sys_text, state_content, seed + 1, policy["max"] - 1, prefix)
+            reads += more
+            usages += more_usages
+    prompt_tokens = next((u["prompt_tokens"] for u in usages if u and u.get("prompt_tokens")), None)
     elapsed_ms = (time.time() - started) * 1e3
 
     answers = {}
@@ -520,10 +547,90 @@ def decide_group(schema, sys_text, state_content, seed, prefix=None, lead=""):
             "samples": {"n": n, "tops": tops, "policy": dict(policy, extended=extended, first_read_entropy=first_entropy)},
             "timing": {"total_ms": elapsed_ms, "reads": n},
             "thought": thought,
+            "prompt_tokens": prompt_tokens,
             "questions": diag_q,
             "engine": "vllm",
         },
     }, len(template) + 1 + (thought["tokens"] if thought else 0)
+
+
+# ----------------------------------------------------------------------------
+# Jev's contract
+# ----------------------------------------------------------------------------
+
+JEV_EXTENSIONS = ("instructions", "samples", "auto_max", "auto_threshold", "steps", "think", "ask", "chunk_rows", "chunk_prompt", "sequential")
+
+
+def jev_schema(body):
+    """This server's schema from a Jev request body."""
+    qs = body.get("questions")
+    if not isinstance(qs, dict) or not qs:
+        raise SchemaError("questions: needs a non-empty map of id -> question")
+    out = []
+    for qid, q in qs.items():
+        if not isinstance(q, dict):
+            raise SchemaError(f"question {qid!r}: must be an object")
+        kind, crit, ins = q.get("type"), q.get("criteria"), q.get("instructions", "")
+        item = {"id": qid, "type": kind, "instructions": ins if isinstance(ins, str) else json.dumps(ins)}
+        if kind == "noul":
+            if crit is not None and not isinstance(crit, dict):
+                raise SchemaError(f"question {qid!r}: noul criteria must be an object with true and false")
+            item["criteria"] = crit
+        elif kind == "choice":
+            if not isinstance(crit, dict) or not crit:
+                raise SchemaError(f"question {qid!r}: choice criteria must map option names to descriptions")
+            item["options"] = [{"name": str(n), "description": d} for n, d in crit.items()]
+        elif kind == "score":
+            if not isinstance(crit, list):
+                raise SchemaError(f"question {qid!r}: score criteria must be an ordered list of levels")
+            item["levels"] = crit
+        else:
+            raise SchemaError(f"question {qid!r}: unknown type {kind!r}")
+        out.append(item)
+    schema = {k: body[k] for k in JEV_EXTENSIONS if k in body}
+    schema["questions"] = out
+    return parse_schema(schema)
+
+
+def image_part(content_type, data):
+    return {"type": "image_url", "image_url": {"url": f"data:{content_type};base64," + base64.b64encode(data).decode()}}
+
+
+def jev_images(value):
+    """Image parts from the body's "images": data URLs, or objects with
+    content_type and base64."""
+    parts = []
+    for i, im in enumerate(value or []):
+        if isinstance(im, str) and im.startswith("data:image/"):
+            parts.append({"type": "image_url", "image_url": {"url": im}})
+        elif isinstance(im, dict) and str(im.get("content_type", "")).startswith("image/") and isinstance(im.get("base64"), str):
+            parts.append({"type": "image_url", "image_url": {"url": f"data:{im['content_type']};base64,{im['base64']}"}})
+        else:
+            raise SchemaError(f"images[{i}]: a data:image/... URL or an object with content_type and base64")
+    return parts
+
+
+def jev_state(body, image_parts=()):
+    """The user message: the state as text (as given, or as JSON), with any
+    images ahead of it."""
+    state = body.get("state")
+    if state is None:
+        raise SchemaError("state: required")
+    text = state if isinstance(state, str) else json.dumps(state)
+    if not image_parts:
+        return text
+    return list(image_parts) + [{"type": "text", "text": text}]
+
+
+def jev_answer(q, a):
+    if q["type"] == "noul":
+        return {"type": "noul", "noul": a["noul"]}
+    if q["type"] == "choice":
+        return {"type": "choice", "choice": a["choice"], "probabilities": a["probabilities"], "confidence": a["confidence"]}
+    names = [c[0] for c in q["choices"]]
+    probs = {str(i): a["probabilities"][n] for i, n in enumerate(names)}
+    return {"type": "score", "score": sum(i * p for i, p in enumerate(probs.values())),
+            "legend": {str(i): n for i, n in enumerate(names)}, "probabilities": probs, "confidence": a["confidence"]}
 
 
 # ----------------------------------------------------------------------------
@@ -552,15 +659,87 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             return self._json(200, {"status": "ok"})
+        if self.path in ("/", "/playground") and TEST_PAGE:
+            body = open(PLAYGROUND, "rb").read()
+            self.send_response(200)
+            self.send_header("content-type", "text/html; charset=utf-8")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         return self._json(404, {"error": {"message": "unknown route"}})
 
+    def _read_request(self):
+        """-> (body, image parts): a JSON body, or multipart/form-data with the
+        JSON in a part named request and each image as a file part, in order."""
+        raw = self.rfile.read(int(self.headers.get("content-length", "0")))
+        ctype = self.headers.get("content-type", "")
+        if not ctype.lower().startswith("multipart/form-data"):
+            return json.loads(raw), []
+        from email.parser import BytesParser
+        from email.policy import HTTP
+        msg = BytesParser(policy=HTTP).parsebytes(b"Content-Type: " + ctype.encode() + b"\r\n\r\n" + raw)
+        body, images = None, []
+        for part in msg.iter_parts():
+            name = part.get_param("name", header="content-disposition")
+            data = part.get_payload(decode=True)
+            if name == "request":
+                body = json.loads(data)
+            elif part.get_content_type().startswith("image/"):
+                images.append(image_part(part.get_content_type(), data))
+            else:
+                raise ValueError(f"part {name!r}: neither the request JSON nor an image")
+        if body is None:
+            raise ValueError("multipart needs a part named request holding the JSON body")
+        return body, images
+
     def do_POST(self):
-        if self.path != "/v1/chat/completions":
-            return self._json(404, {"error": {"message": "unknown route"}})
         try:
-            req = json.loads(self.rfile.read(int(self.headers.get("content-length", "0"))))
+            req, images = self._read_request()
         except Exception as e:
-            return self._json(400, {"error": {"message": f"invalid JSON body: {e}", "type": "invalid_request_error"}})
+            return self._json(400, {"error": {"message": f"invalid body: {e}", "type": "invalid_request_error"}})
+        if self.path == "/v1/systemone":
+            return self._systemone(req, images)
+        if self.path == "/v1/chat/completions":
+            return self._chat(req)
+        return self._json(404, {"error": {"message": "unknown route"}})
+
+    def _decide(self, schema, state, seed):
+        """-> (status, body) with the error body already shaped."""
+        try:
+            return 200, decide(schema, state, seed)
+        except SchemaError as e:
+            return 422, {"error": {"message": str(e), "type": "validation_error"}}
+        except urllib.error.HTTPError as e:
+            return 502, {"error": {"message": f"upstream {e.code}: {e.read()[:300].decode(errors='replace')}", "type": "server_error"}}
+        except Exception as e:
+            return 500, {"error": {"message": repr(e), "type": "server_error"}}
+
+    def _systemone(self, req, images):
+        try:
+            schema = jev_schema(req)
+            state = jev_state(req, images + jev_images(req.get("images")))
+        except SchemaError as e:
+            return self._json(422, {"error": {"message": str(e), "type": "validation_error"}})
+        code, result = self._decide(schema, state, int(req.get("seed", 42)))
+        if code != 200:
+            return self._json(code, result)
+        body, completion_tokens = result
+        answers = {q["id"]: jev_answer(q, body["answers"][q["id"]]) for q in schema["questions"]}
+        labels = " ".join(f"{k}={v['label']}" for k, v in body["answers"].items())
+        print(f"systemone: {labels} reads={body['diagnostics']['samples']['n']} {body['diagnostics']['timing']['total_ms']:.0f}ms", flush=True)
+        self._json(200, {
+            "model": ARGS.model,
+            "answers": answers,
+            # vLLM's prompt count when the reads reported one (it covers images);
+            # the tokenizer's count of the text prompt otherwise.
+            "usage": {"input_tokens": body["diagnostics"].get("prompt_tokens")
+                      or (len(chat_prompt_ids(system_text(schema), state)) if isinstance(state, str) else 0),
+                      "output_tokens": completion_tokens},
+            "diagnostics": body["diagnostics"],
+        })
+
+    def _chat(self, req):
         msgs = req.get("messages") or []
         if len(msgs) != 2 or msgs[0].get("role") not in ("system", "developer") or msgs[1].get("role") != "user":
             return self._json(400, {"error": {"message": "a structured request is exactly two messages: the schema (system) and the state JSON (user)", "type": "invalid_request_error"}})
@@ -580,15 +759,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": {"message": str(e), "type": "invalid_request_error"}})
         except Exception as e:
             return self._json(400, {"error": {"message": f"system must be a JSON question schema and user must be JSON state or image parts: {e}", "type": "invalid_request_error"}})
-        seed = int(req.get("seed", 42))
-        try:
-            body, completion_tokens = decide(schema, state, seed)
-        except SchemaError as e:
-            return self._json(400, {"error": {"message": str(e), "type": "invalid_request_error"}})
-        except urllib.error.HTTPError as e:
-            return self._json(502, {"error": {"message": f"upstream {e.code}: {e.read()[:300].decode(errors='replace')}", "type": "server_error"}})
-        except Exception as e:
-            return self._json(500, {"error": {"message": repr(e), "type": "server_error"}})
+        code, result = self._decide(schema, state, int(req.get("seed", 42)))
+        if code != 200:
+            if code == 422:
+                result["error"]["type"] = "invalid_request_error"
+                code = 400
+            return self._json(code, result)
+        body, completion_tokens = result
         content = json.dumps(body, indent=2)
         labels = " ".join(f"{k}={v['label']}" for k, v in body["answers"].items())
         print(f"structured: {labels} reads={body['diagnostics']['samples']['n']} {body['diagnostics']['timing']['total_ms']:.0f}ms", flush=True)

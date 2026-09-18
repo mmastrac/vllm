@@ -32,6 +32,24 @@ Question types: `noul` (yes/no), `choice` with `options`, `score` with
 ordered `levels`. Each label must be a single token in the answer template,
 which the server checks with the tokenizer before the first request.
 
+The server also speaks the contract of the Jev decision API at
+`POST /v1/systemone`: a body of `state`, `questions` (a map of id to
+`type`, `instructions`, `criteria`) and `model`, with answers in that API's
+shapes (`noul` probability; `choice` with `probabilities` and `confidence`;
+`score` with a 0-indexed `legend`). The schema's options above go in the
+same body as extensions. Images attach as `multipart/form-data` (the JSON
+in a part named `request`, each image a file part) or as an `images` array
+of data URLs. With `TEST_PAGE=1` in the environment, `GET /` serves
+`playground.html`, a page for sending requests with an image file or
+webcam frames.
+
+```bash
+curl -s localhost:8011/v1/systemone -H 'content-type: application/json' -d '{
+  "model": "jev-latest",
+  "state": {"ticket": "Everything is down and we have a demo at noon."},
+  "questions": {"urgent": {"type": "noul", "instructions": "Does the customer need a reply within the hour?"}}}'
+```
+
 `"think": N` in the schema lets the model write up to N tokens in its
 thought channel before the read. The thought is an ordinary generation with
 the chat template's thinking marker on, and the read then runs with the
