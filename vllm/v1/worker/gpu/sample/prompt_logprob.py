@@ -10,13 +10,24 @@ from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.worker.gpu.input_batch import InputBatch
-from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
+from vllm.v1.worker.gpu.sample.logprob import (
+    LogprobTokenIdsState,
+    compute_topk_scores,
+)
 
 
 class PromptLogprobsWorker:
-    def __init__(self, max_num_reqs: int, logprobs_mode: LogprobsMode = "raw_logprobs"):
+    def __init__(
+        self,
+        max_num_reqs: int,
+        logprobs_mode: LogprobsMode = "raw_logprobs",
+        logprob_token_ids_state: LogprobTokenIdsState | None = None,
+    ):
         self.max_num_reqs = max_num_reqs
         self.logprobs_mode = logprobs_mode
+        # A request with logprob_token_ids gets those ids at every prompt
+        # position in place of the top-k, as it does for sampled tokens.
+        self.logprob_token_ids_state = logprob_token_ids_state
 
         self.uses_prompt_logprobs = np.zeros(self.max_num_reqs, dtype=bool)
         self.num_prompt_logprobs = np.zeros(self.max_num_reqs, dtype=np.int32)
@@ -70,6 +81,23 @@ class PromptLogprobsWorker:
             else int(requested_num_prompt_logprobs.max())
         )
 
+        state = self.logprob_token_ids_state
+        max_token_ids = (
+            state.max_num_token_ids(idx_mapping_np[needs_prompt_logprobs])
+            if state is not None
+            else 0
+        )
+        row_idx_mapping = None
+        if max_token_ids > 0:
+            # The request slot of every prompt row, for the token-id fill.
+            num_reqs = len(input_batch.req_ids)
+            query_lens = np.diff(input_batch.query_start_loc_np[: num_reqs + 1])
+            row_idx_mapping = torch.as_tensor(
+                np.repeat(idx_mapping_np, query_lens),
+                dtype=input_batch.idx_mapping.dtype,
+                device=input_batch.idx_mapping.device,
+            )
+
         # Get the prompt logprobs token_ids.
         prompt_logprobs_token_ids = get_prompt_logprobs_token_ids(
             input_batch.num_tokens,
@@ -85,6 +113,9 @@ class PromptLogprobsWorker:
                 logits_fn,
                 max_num_prompt_logprobs,
                 self.logprobs_mode,
+                logprob_token_ids_state=state if max_token_ids > 0 else None,
+                row_idx_mapping=row_idx_mapping,
+                max_per_req_token_ids=max_token_ids,
             )
         )
 
@@ -107,11 +138,17 @@ class PromptLogprobsWorker:
             if not req_is_prompt_chunked:
                 end_idx -= 1
 
-            width = (
-                prompt_logprobs.shape[1]
-                if req_num_prompt_logprobs == -1
-                else req_num_prompt_logprobs + 1
+            num_token_ids = (
+                int(state.num_token_ids.np[idx_mapping_np[i]])
+                if max_token_ids > 0
+                else 0
             )
+            if num_token_ids > 0:
+                width = num_token_ids + 1
+            elif req_num_prompt_logprobs == -1:
+                width = prompt_logprobs.shape[1]
+            else:
+                width = req_num_prompt_logprobs + 1
             # no logprobs if start_idx >= end_idx
             logprobs = (
                 None
@@ -202,6 +239,10 @@ def compute_prompt_logprobs_with_chunking(
     logits_fn: Callable[[torch.Tensor], torch.Tensor],
     num_prompt_logprobs: int,
     logprobs_mode: LogprobsMode = "raw_logprobs",
+    logprob_token_ids_state: LogprobTokenIdsState | None = None,
+    # [num_prompt_tokens] -> request slot, when any request asked for ids
+    row_idx_mapping: torch.Tensor | None = None,
+    max_per_req_token_ids: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # Since materializing the full prompt logits can take too much memory,
     # we compute it in chunks.
@@ -224,6 +265,11 @@ def compute_prompt_logprobs_with_chunking(
             prompt_logits,
             requested_num,
             prompt_token_ids[start_idx:end_idx],
+            logprob_token_ids_state=logprob_token_ids_state,
+            expanded_idx_mapping=(
+                None if row_idx_mapping is None else row_idx_mapping[start_idx:end_idx]
+            ),
+            max_per_req_token_ids=max_per_req_token_ids,
             logits_mode=logits_mode,
         )
         token_ids.append(result.logprob_token_ids)

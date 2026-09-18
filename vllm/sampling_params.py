@@ -294,7 +294,9 @@ class SamplingParams(
     logprobs=-1 when you only need logprobs for a small set of tokens.
     When set, logprobs for exactly these token IDs will be returned,
     in addition to the sampled token. This is useful for scoring tasks
-    where you want to compare probabilities of specific label tokens."""
+    where you want to compare probabilities of specific label tokens.
+    With `prompt_logprobs`, the same IDs are returned at every prompt
+    position in place of the top-k."""
     flat_logprobs: bool = False
     """Whether to return logprobs in flatten format (i.e. FlatLogprob)
     for better performance.
@@ -804,6 +806,17 @@ class SamplingParams(
         if self.logprobs is not None:
             return self.logprobs
         return len(self.logprob_token_ids) if self.logprob_token_ids else None
+
+    @property
+    def num_prompt_logprobs(self) -> int | None:
+        """Number of logprobs to return per prompt token, or `None` if no
+        prompt logprobs were requested. When `logprob_token_ids` is set they
+        replace the top-k, so this is their count."""
+        if self.prompt_logprobs is None:
+            return None
+        if self.logprob_token_ids:
+            return len(self.logprob_token_ids)
+        return self.prompt_logprobs
 
     def clone(self) -> "SamplingParams":
         """If skip_clone is True, uses shallow copy instead of deep copy."""
