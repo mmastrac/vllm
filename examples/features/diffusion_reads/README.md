@@ -31,3 +31,11 @@ curl -s localhost:8011/v1/chat/completions -H 'content-type: application/json' -
 Question types: `noul` (yes/no), `choice` with `options`, `score` with
 ordered `levels`. Each label must be a single token in the answer template,
 which the server checks with the tokenizer before the first request.
+
+`"think": N` in the schema lets the model write up to N tokens in its
+thought channel before the read. The thought is an ordinary generation with
+the chat template's thinking marker on, and the read then runs with the
+thought in its prompt, so the answer slots condition on it. One thought
+serves every noise draw of a decision. `diagnostics.thought` returns the
+text, its length in tokens, whether the model closed the channel itself and
+the generation time.

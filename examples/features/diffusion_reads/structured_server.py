@@ -17,13 +17,16 @@ Schema (system message):
       "levels": ["calm", "annoyed", "furious"]}],
    "instructions": "optional context",
    "samples": "auto" | N, "auto_threshold": 0.1, "auto_max": 4,
-   "steps": 1}
+   "steps": 1, "think": 0}
 
 Up to ten questions answer as "id: label" lines. Past that the id runs
 straight into the label, space separated, at one row fewer a question. A
 schema whose answer template does not fit the canvas is split into chunks
 that run together, each with its own question list ("chunk_rows" sets the
 rows per chunk, "ask" picks a subset of question ids for one read).
+"think": N first lets the model write up to N tokens in its thought
+channel, as an ordinary generation, and the read then runs with that
+thought in its prompt. The noise draws of a decision share one thought.
 
 Serve the model with a canvas that holds the answer template, for example:
   vllm serve google/diffusiongemma-26B-A4B-it \
@@ -48,6 +51,8 @@ PAD = 0
 TOPK = 20
 SCAFFOLD_TEXT = "<|channel>thought\n<channel|>"  # the empty thought block the chat template leaves to the model
 SCAFFOLD = None
+THOUGHT_OPEN = None
+THOUGHT_CLOSE = None
 
 
 # ----------------------------------------------------------------------------
@@ -107,8 +112,11 @@ def parse_schema(value):
     if chunk_prompt not in ("shared", "own"):
         raise SchemaError("schema: chunk_prompt must be \"shared\" or \"own\"")
     sequential = bool(value.get("sequential", False))
+    think = value.get("think", 0)
+    if isinstance(think, bool) or not isinstance(think, int) or not 0 <= think <= 4096:
+        raise SchemaError("schema: think must be a thought budget in tokens, 0 to 4096")
     return {"questions": qs, "instructions": value.get("instructions"), "policy": policy,
-            "steps": max(1, min(int(value.get("steps", 1)), 8)),
+            "steps": max(1, min(int(value.get("steps", 1)), 8)), "think": think,
             "ask": ask, "chunk_rows": chunk_rows, "chunk_prompt": chunk_prompt, "sequential": sequential,
             "format": "lines" if len(qs) <= 10 else "indexed"}
 
@@ -156,14 +164,23 @@ def enc(text):
     return TOK.encode(text, add_special_tokens=False)
 
 
-def resolve_template(qs, scaffold=True, fmt="lines"):
+def init_tokenizer(tok):
+    global TOK, SCAFFOLD, THOUGHT_OPEN, THOUGHT_CLOSE
+    TOK = tok
+    THOUGHT_OPEN = enc("<|channel>thought\n")
+    THOUGHT_CLOSE = enc("<channel|>")
+    SCAFFOLD = enc(SCAFFOLD_TEXT)
+    assert THOUGHT_OPEN + THOUGHT_CLOSE == SCAFFOLD, "the thought tags must tokenize apart"
+
+
+def resolve_template(qs, head, lead, fmt):
     """Tokenize the answer template and find each question's slot. Every label
     must change exactly one token, at the same position for all of a question's
-    labels, or the schema is refused. ``scaffold`` is False for a continuation
-    whose thought block and earlier answers are already in the prompt; its
-    template starts with the join so the tokens match one joint template."""
-    head = SCAFFOLD if scaffold else []
-    lead = "" if scaffold else FORMATS[fmt][0]
+    labels, or the schema is refused. ``head`` is the token run the canvas
+    starts with: the empty thought block for a plain read, nothing when the
+    prompt already ends the thought channel. ``lead`` is the text before the
+    first answer: the join when earlier answers are in the prompt, so the
+    tokens match one joint template."""
     base_labels = [0] * len(qs)
     base = head + enc(lead + answer_text(qs, base_labels, fmt))
     if len(base) + 1 > CANVAS_LEN:
@@ -195,11 +212,11 @@ def resolve_template(qs, scaffold=True, fmt="lines"):
 _template_cache = {}
 
 
-def template_for(schema, scaffold=True):
+def template_for(schema, head, lead):
     fmt = schema.get("format", "lines")
-    key = json.dumps([scaffold, fmt] + [(q["id"], q["labels"]) for q in schema["questions"]])
+    key = json.dumps([head, lead, fmt] + [(q["id"], q["labels"]) for q in schema["questions"]])
     if key not in _template_cache:
-        _template_cache[key] = resolve_template(schema["questions"], scaffold, fmt)
+        _template_cache[key] = resolve_template(schema["questions"], head, lead, fmt)
     return _template_cache[key]
 
 
@@ -233,13 +250,36 @@ def upstream_chat(body, timeout=600):
     return json.load(urllib.request.urlopen(req, timeout=timeout))
 
 
-def chat_prompt_ids(sys_text, state_text):
+def upstream_completions(body, timeout=600):
+    req = urllib.request.Request(ARGS.upstream.rstrip("/") + "/v1/completions", data=json.dumps(body).encode(),
+                                 headers={"content-type": "application/json"})
+    return json.load(urllib.request.urlopen(req, timeout=timeout))
+
+
+def chat_prompt_ids(sys_text, state_text, thinking=False):
     """The prompt the chat endpoint would build, as token ids, ending after
-    the model turn marker. Text states only."""
+    the model turn marker. Text states only. ``thinking`` turns the chat
+    template's thinking marker on."""
     messages = [{"role": "system", "content": sys_text}, {"role": "user", "content": state_text}]
-    out = TOK.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, enable_thinking=False)
+    out = TOK.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, enable_thinking=thinking)
     ids = out["input_ids"] if hasattr(out, "keys") else out  # newer transformers return a dict
     return [int(t) for t in ids]
+
+
+def think(sys_text, state_text, budget):
+    """A read prefix that ends a thought the model wrote: the chat prompt with
+    thinking on, the open tag, up to ``budget`` generated tokens, the close
+    tag. Returns the prefix and a diagnostics dict for the thought."""
+    prompt = chat_prompt_ids(sys_text, state_text, thinking=True) + THOUGHT_OPEN
+    started = time.time()
+    d = upstream_completions({"model": ARGS.model, "prompt": prompt, "max_tokens": budget, "logprobs": 0,
+                              "return_tokens_as_token_ids": True, "stop_token_ids": THOUGHT_CLOSE})
+    ids = [int(t.split(":")[1]) for t in d["choices"][0]["logprobs"]["tokens"]]
+    closed = THOUGHT_CLOSE[0] in ids
+    if closed:
+        ids = ids[: ids.index(THOUGHT_CLOSE[0])]
+    info = {"tokens": len(ids), "closed": closed, "ms": (time.time() - started) * 1e3, "text": TOK.decode(ids)}
+    return prompt + ids + THOUGHT_CLOSE, info
 
 
 def one_read(schema, template, slots, sys_text, state_content, seed, prefix=None):
@@ -302,9 +342,7 @@ def one_read_continuation(schema, template, slots, prompt_ids, seed):
         "vllm_xargs": {"diffusion_seed_canvas": build_canvas(template, slots, seed), "diffusion_canvas_length": canvas_width(template),
                        "diffusion_max_steps": schema["steps"], "diffusion_read_only": True},
     }
-    req = urllib.request.Request(ARGS.upstream.rstrip("/") + "/v1/completions", data=json.dumps(body).encode(),
-                                 headers={"content-type": "application/json"})
-    d = json.load(urllib.request.urlopen(req, timeout=600))
+    d = upstream_completions(body)
     rows = d["choices"][0]["logprobs"]["top_logprobs"]
     out = []
     for q, sl in zip(schema["questions"], slots):
@@ -369,6 +407,7 @@ def decide(schema, state_content, seed):
     # per-word PII: 3 of 42 decisions flipped, none with own lists).
     shared = schema["chunk_prompt"] == "shared"
     sys_shared = system_text(schema, chunked=True)
+    thought = None
 
     def one(k_group):
         k, group = k_group
@@ -383,19 +422,28 @@ def decide(schema, state_content, seed):
         sys_text = system_text(schema)
         if not isinstance(state_content, str):
             raise SchemaError("sequential chunks need a text state (images go through the chat endpoint)")
-        base_ids = chat_prompt_ids(sys_text, state_content) + SCAFFOLD
+        if schema["think"]:
+            base_ids, thought = think(sys_text, state_content, schema["think"])
+        else:
+            base_ids = chat_prompt_ids(sys_text, state_content) + SCAFFOLD
+        join = FORMATS[schema["format"]][0]
         lines = []
         parts = []
         for k, group in enumerate(groups):
             sub = dict(schema, questions=group)
-            prefix = base_ids + enc(FORMATS[schema["format"]][0].join(lines)) if lines else None
-            body, rows = decide_group(sub, sys_text, state_content, seed + 104729 * k, prefix=prefix)
+            if lines:
+                prefix, lead = base_ids + enc(join.join(lines)), join
+            else:
+                prefix, lead = (base_ids if thought else None), ""
+            body, rows = decide_group(sub, sys_text, state_content, seed + 104729 * k, prefix, lead)
             parts.append((body, rows))
             chosen = [q["labels"].index(body["answers"][q["id"]]["label"]) for q in group]
             lines.append(answer_text(group, chosen, schema["format"]))
     else:
         with ThreadPoolExecutor(max_workers=len(groups)) as ex:
             parts = list(ex.map(one, enumerate(groups)))
+        if schema["think"]:
+            thought = [b["diagnostics"]["thought"] for b, _ in parts]
     answers, diag_q = {}, {}
     for body, _ in parts:
         answers.update(body["answers"])
@@ -407,6 +455,7 @@ def decide(schema, state_content, seed):
             "chunks": [[q["id"] for q in g] for g in groups],
             "chunk_prompt": "full" if schema["sequential"] else schema["chunk_prompt"],
             "sequential": schema["sequential"],
+            "thought": thought,
             "samples": {"n": [b["diagnostics"]["samples"]["n"] for b, _ in parts],
                         "tops": [b["diagnostics"]["samples"]["tops"] for b, _ in parts],
                         "policy": [b["diagnostics"]["samples"]["policy"] for b, _ in parts]},
@@ -415,12 +464,17 @@ def decide(schema, state_content, seed):
             "questions": diag_q,
             "engine": "vllm",
         },
-    }, sum(rows for _, rows in parts)
+    }, sum(rows for _, rows in parts) + (thought["tokens"] if isinstance(thought, dict) else 0)
 
 
-def decide_group(schema, sys_text, state_content, seed, prefix=None):
-    template, slots = template_for(schema, scaffold=prefix is None)
+def decide_group(schema, sys_text, state_content, seed, prefix=None, lead=""):
     started = time.time()
+    thought = None
+    if prefix is None and schema["think"]:
+        if not isinstance(state_content, str):
+            raise SchemaError("think needs a text state (images go through the chat endpoint)")
+        prefix, thought = think(sys_text, state_content, schema["think"])
+    template, slots = template_for(schema, SCAFFOLD if prefix is None else [], lead)
     policy = schema["policy"]
     if policy["mode"] == "fixed":
         reads = read_many(schema, template, slots, sys_text, state_content, seed, policy["n"], prefix)
@@ -465,10 +519,11 @@ def decide_group(schema, sys_text, state_content, seed, prefix=None):
             "steps": schema["steps"],
             "samples": {"n": n, "tops": tops, "policy": dict(policy, extended=extended, first_read_entropy=first_entropy)},
             "timing": {"total_ms": elapsed_ms, "reads": n},
+            "thought": thought,
             "questions": diag_q,
             "engine": "vllm",
         },
-    }, len(template) + 1
+    }, len(template) + 1 + (thought["tokens"] if thought else 0)
 
 
 # ----------------------------------------------------------------------------
@@ -548,7 +603,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global ARGS, TOK, SCAFFOLD, CANVAS_LEN, CANVAS_STEP
+    global ARGS, CANVAS_LEN, CANVAS_STEP
     p = argparse.ArgumentParser()
     p.add_argument("--upstream", default="http://127.0.0.1:8010")
     p.add_argument("--model", default="dgemma")
@@ -560,8 +615,7 @@ def main():
     ARGS = p.parse_args()
     CANVAS_LEN = ARGS.canvas
     CANVAS_STEP = ARGS.canvas_step
-    TOK = AutoTokenizer.from_pretrained(ARGS.tokenizer)
-    SCAFFOLD = enc(SCAFFOLD_TEXT)
+    init_tokenizer(AutoTokenizer.from_pretrained(ARGS.tokenizer))
     print(f"structured server on {ARGS.host}:{ARGS.port} -> {ARGS.upstream} (canvas {CANVAS_LEN})", flush=True)
     ThreadingHTTPServer((ARGS.host, ARGS.port), Handler).serve_forever()
 
