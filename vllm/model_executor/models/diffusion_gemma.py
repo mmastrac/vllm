@@ -185,6 +185,11 @@ class DiffusionGemmaForConditionalGeneration(
         text_config = vllm_config.model_config.hf_text_config
         self.config = config
         self.model_dtype = vllm_config.model_config.dtype
+        # Read by the image/video path borrowed from Gemma4 below.
+        lora_config = vllm_config.lora_config
+        self._enable_mm_lora = bool(
+            lora_config is not None and lora_config.enable_tower_connector_lora
+        )
 
         # DiffusionGemma's full-attention layers have NO v_proj — V is
         # computed from k_proj's output (`value_states = key_states` before
