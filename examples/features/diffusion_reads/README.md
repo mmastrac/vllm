@@ -37,7 +37,9 @@ The server also speaks the contract of the Jev decision API at
 `type`, `instructions`, `criteria`) and `model`, with answers in that API's
 shapes (`noul` probability; `choice` with `probabilities` and `confidence`;
 `score` with a 0-indexed `legend`). The schema's options above go in the
-same body as extensions. Images attach as `multipart/form-data` (the JSON
+same body as extensions. A question may declare `depends_on` (read in a later stage with those
+answers in its prompt), `ask_if` (asked only when a named question's answer
+is among the listed ones, else null) and `alone` (a read of its own). Images attach as `multipart/form-data` (the JSON
 in a part named `request`, each image a file part) or as an `images` array
 of data URLs. With `TEST_PAGE=1` in the environment, `GET /` serves
 `playground.html`, a page for sending requests with an image file or
