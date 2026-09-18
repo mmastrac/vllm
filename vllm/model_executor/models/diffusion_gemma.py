@@ -649,7 +649,7 @@ def _compiled_sample_step(
                 soft_embeds, group_name=tp_group_name
             )
         soft_embeds = soft_embeds * normalizer
-        sc_embeds[decode_slots] = soft_embeds * sc_keep
+        sc_embeds[decode_slots] = (soft_embeds * sc_keep).to(sc_embeds.dtype)
     else:
         # Every slot in this tile ends after this step, so the soft embed
         # would never be read. The matmul is a full pass over the vocabulary
