@@ -37,6 +37,7 @@
     <div class="bar">
       <button class="primary" id="send">Send</button>
       <label>seed <input id="seed" type="number" value="42" style="width:6em"></label>
+      <label>api key <input id="key" type="password" placeholder="if the server has API_KEY" style="width:12em"></label>
       <span id="status" class="muted"></span>
     </div>
     <div class="bar">
@@ -87,6 +88,9 @@ const imageExample = {
   }
 };
 $("req").value = JSON.stringify(example, null, 2);
+try { $("key").value = localStorage.getItem("djev_api_key") || ""; } catch (e) {}
+$("key").onchange = () => { try { localStorage.setItem("djev_api_key", $("key").value); } catch (e) {} };
+function authHeaders(h) { const k = $("key").value.trim(); if (k) h["authorization"] = "Bearer " + k; return h; }
 
 let blob = null;          // the attached image
 let stream = null;        // webcam
@@ -172,9 +176,9 @@ async function send() {
       const fd = new FormData();
       fd.append("request", JSON.stringify(body));
       fd.append("image", blob, "image.jpg");
-      resp = await fetch("/v1/systemone", {method: "POST", body: fd});
+      resp = await fetch("/v1/systemone", {method: "POST", headers: authHeaders({}), body: fd});
     } else {
-      resp = await fetch("/v1/systemone", {method: "POST", headers: {"content-type": "application/json"}, body: JSON.stringify(body)});
+      resp = await fetch("/v1/systemone", {method: "POST", headers: authHeaders({"content-type": "application/json"}), body: JSON.stringify(body)});
     }
     text = await resp.text();
   } catch (e) {
