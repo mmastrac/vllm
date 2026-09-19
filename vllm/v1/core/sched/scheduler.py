@@ -54,11 +54,7 @@ from vllm.v1.core.sched.request_queue import (
     SchedulingPolicy,
     create_request_queue,
 )
-from vllm.v1.core.sched.utils import (
-    check_stop,
-    diffusion_canvas_width,
-    remove_all,
-)
+from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
@@ -622,11 +618,8 @@ class Scheduler(SchedulerInterface):
                 # count, we subtract (num_output_placeholders - 1) to remove any draft
                 # tokens, so that we can be sure no further steps are needed even if
                 # they are all rejected.
-                and (
-                    request.num_computed_tokens + 2 - request.num_output_placeholders
-                    >= request.num_prompt_tokens + request.max_tokens
-                    or self._diffusion_read_in_flight(request)
-                )
+                and request.num_computed_tokens + 2 - request.num_output_placeholders
+                >= request.num_prompt_tokens + request.max_tokens
             ):
                 # Async scheduling: Avoid scheduling an extra step when we are sure that
                 # the previous step has reached request.max_tokens. We don't schedule
@@ -2379,23 +2372,6 @@ class Scheduler(SchedulerInterface):
 
         self._enqueue_waiting_request(request)
         return False
-
-    def _diffusion_read_in_flight(self, request: Request) -> bool:
-        """Whether a read-only diffusion request already has every denoise
-        step it will run in flight. It emits its canvas on the last of them
-        and ends, so another step would only be discarded."""
-        if self.num_sampled_tokens_per_step != 0 or request.sampling_params is None:
-            return False
-        extra = request.sampling_params.extra_args
-        if not extra or not extra.get("diffusion_read_only"):
-            return False
-        steps = extra.get("diffusion_max_steps")
-        diffusion_config = self.vllm_config.diffusion_config
-        if not steps or diffusion_config is None:
-            return False
-        width = diffusion_canvas_width(request, diffusion_config.canvas_length)
-        # Each in-flight denoise step holds one canvas of placeholders.
-        return request.num_output_placeholders >= steps * width
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int], is_stale: bool = False
