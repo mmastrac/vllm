@@ -319,6 +319,10 @@ class TritonAttentionBackend(AttentionBackend):
     def supports_non_causal(cls) -> bool:
         return True
 
+    @classmethod
+    def supports_per_request_causal(cls) -> bool:
+        return True
+
     @staticmethod
     def get_name() -> str:
         return "TRITON_ATTN"
