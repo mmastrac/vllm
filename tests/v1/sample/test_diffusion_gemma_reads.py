@@ -8,9 +8,13 @@ import pytest
 import torch
 
 from vllm.model_executor.models.diffusion_gemma import (
+    _MASKED_LOGIT,
     DiffusionGemmaRequestStates,
     _compiled_sample_step,
     _concat_logprob_stashes,
+    _mask_rows_to_allowed,
+    _denoise_temperature,
+    sample_row_stats_reference,
 )
 from vllm.platforms import current_platform
 from vllm.v1.outputs import LogprobsTensors
@@ -72,6 +76,131 @@ def test_apply_seed_canvases_leaves_unseeded_batches_alone():
     assert torch.equal(states.canvas[0], before)
 
 
+def test_renoised_slot_keeps_only_its_pinned_seed():
+    """A child of a diffusion_samples request takes the seed at its pinned
+    positions and fresh noise elsewhere. Siblings differ at the unpinned
+    positions."""
+    states = _states()
+    seed = list(range(CL))
+    pins = [0, 2, 3]
+    for slot in (0, 1):
+        states.add_request(slot)
+        states.set_seed_canvas(slot, seed)
+        states.set_pins(slot, pins)
+        states.set_renoise(slot)
+    states.add_request(2)
+    states.set_seed_canvas(2, seed)
+    states.set_pins(2, pins)
+    slots, slots_gpu = _slots(0, 1, 2)
+    torch.manual_seed(0)
+    states.init_canvas(slots_gpu)
+    noise = states.canvas[slots_gpu].clone()
+
+    states.apply_seed_canvases(slots, slots_gpu)
+
+    after = states.canvas[slots_gpu]
+    free = [p for p in range(CL) if p not in pins]
+    for slot in (0, 1):
+        assert after[slot, pins].tolist() == [seed[p] for p in pins]
+        assert torch.equal(after[slot, free], noise[slot, free])
+    assert after[2].tolist() == seed
+    assert not torch.equal(after[0, free], after[1, free])
+
+
+def test_renoise_seed_reproduces_the_draw():
+    """The same seed draws the same noise and another seed draws other
+    noise. An unseeded child takes the engine's RNG."""
+    seed = list(range(CL))
+    pins = [0, 1]
+    free = [p for p in range(CL) if p not in pins]
+
+    def draw(states, slot, request_seed):
+        states.add_request(slot)
+        states.set_seed_canvas(slot, seed)
+        states.set_pins(slot, pins)
+        states.set_renoise(slot, request_seed)
+        slots, slots_gpu = _slots(slot)
+        states.init_canvas(slots_gpu)
+        states.apply_seed_canvases(slots, slots_gpu)
+        return states.canvas[slot].clone()
+
+    a = draw(_states(), 0, 7)
+    b = draw(_states(), 3, 7)
+    c = draw(_states(), 0, 8)
+    assert torch.equal(a, b)
+    assert a[pins].tolist() == seed[: len(pins)]
+    assert not torch.equal(a[free], c[free])
+
+    states = _states()
+    torch.manual_seed(0)
+    unseeded = draw(states, 0, None)
+    assert unseeded[pins].tolist() == seed[: len(pins)]
+    assert not torch.equal(unseeded[free], a[free])
+
+
+def test_sampler_seeds_the_children_of_a_samples_request():
+    """Only a diffusion_samples child gets the request seed on its slot."""
+    from types import SimpleNamespace
+
+    from vllm.model_executor.models.diffusion_gemma import DiffusionSampler
+    from vllm.sampling_params import SamplingParams
+
+    state = object.__new__(DiffusionSampler)
+    state.sampling_states = SimpleNamespace(add_request=lambda *a: None)
+    state.logprob_token_ids_state = SimpleNamespace(add_request=lambda *a: None)
+    state.diffusion_states = _states()
+    state.canvas_length = CL
+    state._pending_logprobs = {}
+    for slot in range(3):
+        state.diffusion_states.add_request(slot)
+    canvas = list(range(CL))
+
+    state.add_request(
+        0,
+        SamplingParams(
+            seed=7,
+            extra_args={
+                "diffusion_seed_canvas": canvas,
+                "diffusion_pinned": [0],
+                "diffusion_samples": 4,
+            },
+        ),
+    )
+    state.add_request(
+        1,
+        SamplingParams(
+            extra_args={
+                "diffusion_seed_canvas": canvas,
+                "diffusion_pinned": [0],
+                "diffusion_samples": 4,
+            }
+        ),
+    )
+    state.add_request(
+        2,
+        SamplingParams(
+            seed=7,
+            extra_args={"diffusion_seed_canvas": canvas, "diffusion_pinned": [0]},
+        ),
+    )
+    states = state.diffusion_states
+    assert states.renoise_slots == {0, 1}
+    assert states.renoise_seed == {0: 7}
+    assert states.seeded_slots == {0, 1, 2}
+
+
+def test_add_request_clears_renoise():
+    states = _states()
+    states.add_request(0)
+    states.set_renoise(0, 5)
+    assert states.renoise_slots == {0}
+    assert states.renoise_seed == {0: 5}
+    states.add_request(0)
+    assert states.renoise_slots == set()
+    assert states.renoise_seed == {}
+    assert not states.renoise[0].item()
+
+
 def test_add_request_clears_seed_and_read_only():
     states = _states()
     states.add_request(0)
@@ -119,6 +248,8 @@ def _denoise_once(
     width: int = CL,
     embed_weight: torch.Tensor | None = None,
     embed_dtype: torch.dtype = torch.float32,
+    logits: torch.Tensor | None = None,
+    valid: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """One compiled denoise step over ``slots`` with flat logits, so nothing
     converges by stability or confidence and only the step cap can end it.
@@ -130,13 +261,25 @@ def _denoise_once(
     decode_idx = torch.arange(n, dtype=torch.int64, device=device)
     sampled = torch.zeros(n, CL, dtype=torch.int32, device=device)[:, :width]
     num_sampled = torch.zeros(n, dtype=torch.int32, device=device)
+    temp = _denoise_temperature(states.step, decode_slots, float(MAX_STEPS), 0.5, 1.0)
+    argmax, sample, entropy, probs = sample_row_stats_reference(
+        torch.zeros(n * width, VOCAB, device=device) if logits is None else logits,
+        temp,
+        width,
+        embed_dtype if compute_sc else None,
+    )
     _compiled_sample_step(
-        torch.zeros(n * width, VOCAB, device=device),
+        sample.view(n, width),
+        argmax.view(n, width),
+        entropy.view(n, width),
+        probs.view(n, width, -1) if probs is not None else None,
         decode_slots,
         decode_idx,
         decode_slots,
-        torch.full((n,), width, dtype=torch.int64, device=device),
-        states.canvas[:, :width],
+        torch.full(
+            (n,), width if valid is None else valid, dtype=torch.int64, device=device
+        ),
+        states.canvas,
         states.argmax_canvas[:, :width],
         states.step,
         states.is_encoder_phase,
@@ -157,9 +300,6 @@ def _denoise_once(
         sampled,
         num_sampled,
         torch.zeros(MAX_REQS, CL, dtype=torch.int64, device=device),
-        max_denoising_steps=float(MAX_STEPS),
-        t_min=0.5,
-        t_max=1.0,
         confidence_threshold=0.1,
         vocab_size=VOCAB,
         CL=width,
@@ -317,3 +457,90 @@ def test_read_emits_at_convergence_while_generation_waits_for_commit(width, step
     sampled, counts = _denoise_once(states, [0], width=width)
     assert counts.tolist() == [width]
     assert torch.equal(sampled[0], states.argmax_canvas[0, :width].int())
+
+
+def test_batch_allowed_needs_one_shared_set():
+    states = _states()
+    states.constrained[0] = (1, 2, 3)
+    states.constrained[1] = (4, 5)
+
+    # Mixed sets, or a slot with no set, fall back to per-row masking.
+    assert states.batch_allowed([0, 1]) is None
+    assert states.batch_allowed([0, 2]) is None
+    assert states.batch_allowed([]) is None
+
+    shared = states.batch_allowed([0])
+    assert shared.tolist() == [1, 2, 3]
+    assert shared.dtype == torch.int64
+    assert states.batch_allowed([0, 0]) is shared
+    assert states.allowed_tensor((1, 2, 3)) is shared
+
+
+def test_mask_rows_to_allowed_masks_only_constrained_rows():
+    logits = torch.randn(5, VOCAB, device="cuda")
+    before = logits.clone()
+    first = torch.tensor([3, 7], device="cuda")
+    third = torch.tensor([0], device="cuda")
+
+    out = _mask_rows_to_allowed(logits, [0, 2, 3], [2, 1, 2], [first, None, third])
+
+    assert out is not logits
+    assert torch.equal(logits, before)
+    # Masked columns hold the finite sentinel, so entropy stays finite.
+    kept = out > _MASKED_LOGIT
+    assert torch.isfinite(out).all()
+    assert kept[0:2].sum(dim=1).tolist() == [2, 2]
+    assert kept[0:2][:, first].all()
+    assert torch.equal(out[0:2][:, first], before[0:2][:, first])
+    assert torch.equal(out[2], before[2])
+    assert kept[3:5].sum(dim=1).tolist() == [1, 1]
+    assert torch.equal(out[3:5][:, third], before[3:5][:, third])
+    # The masked row's softmax is the distribution renormalized over the set.
+    torch.testing.assert_close(
+        out[0].softmax(dim=-1)[first], before[0, first].softmax(dim=-1)
+    )
+
+
+def test_mask_rows_to_allowed_is_a_no_op_without_constrained_rows():
+    logits = torch.randn(3, VOCAB, device="cuda")
+    assert _mask_rows_to_allowed(logits, [0, 1], [1, 2], [None, None]) is logits
+
+
+def test_masked_logits_keep_a_finite_entropy():
+    """top_k/top_p mask logits to -inf. A row with one live column has zero
+    entropy, so the slot must come out confident, not NaN and never confident."""
+    states = _states()
+    states.add_request(0)
+    logits = torch.full((CL, VOCAB), float("-inf"), device="cuda")
+    logits[:, 3] = 0.0
+
+    _denoise_once(states, [0], logits=logits)
+
+    assert bool(states.confident[0])
+
+
+def test_commit_renoises_the_whole_row_not_just_the_tile():
+    """A narrow tile's commit must leave no stale tokens past its width, or a
+    wider next block starts from an older block's text."""
+    states = _states()
+    states.add_request(0)
+    states.canvas[0] = 7
+    states.is_encoder_phase[0] = True  # this step is the commit
+
+    _denoise_once(states, [0], width=4)
+
+    assert not bool((states.canvas[0, 4:] == 7).all())
+    assert not bool(states.is_encoder_phase[0])
+
+
+def test_confidence_ignores_positions_past_the_scheduled_width():
+    """Padded positions are uniform; a block scheduled narrower than its tile
+    must still converge on its real positions."""
+    states = _states()
+    states.add_request(0)
+    logits = torch.zeros(CL, VOCAB, device="cuda")
+    logits[:2, 3] = 40.0  # two real, peaked positions; the rest are padding
+
+    _denoise_once(states, [0], logits=logits, valid=2)
+
+    assert bool(states.confident[0])

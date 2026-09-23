@@ -24,3 +24,17 @@ class DiffusionConfig:
     max_denoising_steps: int | None = None
     """Maximum number of denoising iterations per canvas block.
     If not set, read from the model's generation_config.json."""
+
+    max_samples: int = Field(default=32, ge=1)
+    """Largest ``diffusion_samples`` a request may ask for: the number of
+    child requests one seeded canvas fans out into."""
+
+    canvas_length_per_batch_size: list[tuple[int, int, int]] | None = None
+    """Load-adaptive canvas width for generation. Each entry is an inclusive
+    batch-size range ``(range_start, range_end, canvas_width)``; the async
+    scheduler picks the width for each block of a request from the number of
+    running and waiting requests when the block starts, so a lightly loaded
+    server denoises wide blocks (more tokens per forward pass) and a busy one
+    denoises narrow blocks (more requests per forward pass). Widths must not
+    exceed ``canvas_length``. Requests that set ``diffusion_canvas_length``
+    keep it. None uses ``canvas_length`` for every block."""

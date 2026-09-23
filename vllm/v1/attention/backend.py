@@ -189,6 +189,12 @@ class AttentionBackend(ABC):
         return False
 
     @classmethod
+    def supports_per_request_causal(cls) -> bool:
+        """Whether the metadata builder accepts `causal` as a per-request
+        tensor, so one batch can mix causal and bidirectional requests."""
+        return False
+
+    @classmethod
     def supports_non_causal(cls) -> bool:
         """Check if backend supports non-causal (bidirectional) attention
         for decoder models.

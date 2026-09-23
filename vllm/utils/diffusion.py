@@ -16,6 +16,7 @@ def validate_diffusion_sampling_params(
     canvas_length: int | None,
     vocab_size: int,
     async_scheduling: bool | None,
+    max_samples: int = 32,
 ) -> None:
     """Validate request options and normalize one-canvas reads at admission."""
     extra = params.extra_args
@@ -94,6 +95,18 @@ def validate_diffusion_sampling_params(
             params.max_tokens = min(params.max_tokens or expected_len, expected_len)
         params.ignore_eos = True
 
+    constrained = extra.get("diffusion_constrained")
+    if constrained is not None:
+        check(
+            isinstance(constrained, (bool, int)) and constrained in (0, 1),
+            "diffusion_constrained must be a boolean (or 0/1).",
+        )
+    if constrained:
+        check(
+            bool(params.logprob_token_ids),
+            "diffusion_constrained needs logprob_token_ids: they are the allowed set.",
+        )
+
     check(
         bool(async_scheduling)
         or width is None
@@ -102,3 +115,29 @@ def validate_diffusion_sampling_params(
         "A diffusion_canvas_length smaller than the served canvas "
         "requires --async-scheduling.",
     )
+
+    # diffusion_samples: k fans the request out into k children, as n does.
+    # Each child re-noises the unpinned positions of the seed canvas.
+    samples = extra.get("diffusion_samples")
+    if samples is not None:
+        check(
+            isinstance(samples, int) and not isinstance(samples, bool) and samples > 0,
+            "diffusion_samples must be a positive integer.",
+        )
+        check(
+            samples <= max_samples,
+            f"diffusion_samples must be at most {max_samples} "
+            "(the served diffusion_config.max_samples).",
+        )
+        if samples > 1:
+            check(
+                seed is not None and pins is not None,
+                "diffusion_samples needs a diffusion_seed_canvas and "
+                "diffusion_pinned: the unpinned positions are the ones "
+                "re-noised per sample.",
+            )
+            check(
+                params.n == 1,
+                "diffusion_samples and n cannot both be set.",
+            )
+            params.n = samples

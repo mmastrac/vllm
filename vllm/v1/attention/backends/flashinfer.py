@@ -453,6 +453,10 @@ class FlashInferBackend(AttentionBackend):
         return True
 
     @classmethod
+    def supports_per_request_causal(cls) -> bool:
+        return True
+
+    @classmethod
     def supports_device_cpu_query_lens_mismatch(cls) -> bool:
         # Only trtllm-gen decode (SM100 family) reads query offsets from the
         # device tensor; XQA and wrapper decode plan from qo_indptr_cpu, and
@@ -552,10 +556,23 @@ class FlashInferBackend(AttentionBackend):
 
 
 @dataclass
+class FIPrefillPart:
+    """One causal-uniform subset of a prefill batch with per-request causality."""
+
+    wrapper: BatchPrefillWithPagedKVCacheWrapper
+    causal: bool
+    tokens: torch.Tensor
+    """int64 indices into the prefill query slice, in request order."""
+
+
+@dataclass
 class FIPrefill:
     """Metadata for the native FlashInfer prefill pathway (non-TRTLLM)."""
 
-    wrapper: BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper
+    wrapper: BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper | None
+    parts: list[FIPrefillPart] | None = None
+    """Set instead of `wrapper` when the batch mixes causal and non-causal
+    requests: each part is planned on its own wrapper over its own tokens."""
 
 
 @dataclass
@@ -655,7 +672,8 @@ class FlashInferMetadata:
     num_decode_tokens: int
     num_prefills: int
     num_prefill_tokens: int
-    causal: bool
+    causal: bool | torch.Tensor
+    """The plan's causal flag, or the per-request tensor when prefills are split."""
 
     prefill: FIPrefill | TRTLLMPrefill | None
     """
@@ -703,6 +721,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             None  # Wrapper for non-causal prefill (DFlash)
         )
         self._decode_wrapper = None  # Wrapper for decode (general shape)
+        # Page lists for the causal and non-causal halves of a split prefill.
+        self._split_paged_kv_indices: list[torch.Tensor] | None = None
 
         if envs.VLLM_BATCH_INVARIANT:
             self.decode_fixed_split_size = 2048
@@ -1287,6 +1307,104 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.paged_kv_last_page_len.copy_to_gpu(num_reqs)
         return paged_kv_indices
 
+    def _plan_split_prefill(
+        self,
+        flags: np.ndarray,
+        prefill_start: int,
+        num_reqs: int,
+        qo_indptr_cpu: torch.Tensor,
+        num_blocks_np: np.ndarray,
+        block_table_tensor: torch.Tensor,
+    ) -> FIPrefill:
+        """Plan the causal and the non-causal prefill requests as two subsets.
+
+        Each subset gets its own qo/kv indptr, page list and last-page lengths,
+        and a token index into the prefill query slice so forward() can gather
+        its queries and scatter its output. `flags` holds one bool per prefill
+        request; `num_blocks_np` and the last-page buffer cover all requests.
+        """
+        if self.is_kvcache_nvfp4:
+            raise NotImplementedError(
+                "FlashInfer per-request causal attention is not supported with "
+                "NVFP4 KV cache."
+            )
+        if self._split_paged_kv_indices is None:
+            self._split_paged_kv_indices = [
+                torch.zeros_like(self.paged_kv_indices) for _ in range(2)
+            ]
+        qo_np = qo_indptr_cpu[: num_reqs + 1].numpy()
+        q_lens_np = qo_np[1:] - qo_np[:-1]
+        q_start_np = qo_np[:-1] - qo_np[prefill_start]
+        last_page_len_np = self.paged_kv_last_page_len.np[:num_reqs]
+        o_dtype = self.model_config.dtype
+        parts: list[FIPrefillPart] = []
+        for part_idx, part_causal in enumerate((True, False)):
+            reqs = np.nonzero(flags == part_causal)[0] + prefill_start
+            n = len(reqs)
+            qo_indptr_np = np.zeros(n + 1, dtype=np.int32)
+            np.cumsum(q_lens_np[reqs], out=qo_indptr_np[1:])
+            kv_indptr_np = np.zeros(n + 1, dtype=np.int32)
+            np.cumsum(num_blocks_np[reqs], out=kv_indptr_np[1:])
+            tokens_np = np.repeat(
+                q_start_np[reqs] - qo_indptr_np[:-1], q_lens_np[reqs]
+            ) + np.arange(qo_indptr_np[-1], dtype=np.int64)
+
+            def to_device(arr: np.ndarray) -> torch.Tensor:
+                t = torch.from_numpy(arr)
+                if PIN_MEMORY:
+                    t = t.pin_memory()
+                return t.to(self.device, non_blocking=True)
+
+            kv_indptr = to_device(kv_indptr_np)
+            paged_kv_indices = self._split_paged_kv_indices[part_idx][
+                : kv_indptr_np[-1]
+            ]
+            part_block_table = block_table_tensor[to_device(reqs)]
+            _copy_page_indices_kernel[(n,)](
+                paged_kv_indices,
+                part_block_table,
+                part_block_table.stride(0),
+                kv_indptr,
+                BLOCK_SIZE=1024,
+            )
+            qo_indptr = torch.from_numpy(qo_indptr_np)
+            kv_indptr_cpu = torch.from_numpy(kv_indptr_np)
+            last_page_len = torch.from_numpy(last_page_len_np[reqs])
+            kv_lens = get_seq_lens(kv_indptr_cpu, last_page_len, self.page_size)
+            if PIN_MEMORY:
+                qo_indptr = qo_indptr.pin_memory()
+                kv_indptr_cpu = kv_indptr_cpu.pin_memory()
+                last_page_len = last_page_len.pin_memory()
+                kv_lens = kv_lens.pin_memory()
+            wrapper = self._get_prefill_wrapper(causal=part_causal)
+            assert isinstance(wrapper, BatchPrefillWithPagedKVCacheWrapper)
+            wrapper.plan(
+                qo_indptr=qo_indptr,
+                paged_kv_indptr=kv_indptr_cpu,
+                paged_kv_indices=paged_kv_indices,
+                paged_kv_last_page_len=last_page_len,
+                seq_lens=kv_lens,
+                num_qo_heads=self.num_qo_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim_qk=self.head_dim,
+                page_size=self.page_size,
+                causal=part_causal,
+                sm_scale=self.sm_scale,
+                window_left=self.window_left,
+                logits_soft_cap=self.logits_soft_cap,
+                q_data_type=self.q_data_type_prefill,
+                kv_data_type=self.kv_cache_dtype,
+                o_data_type=o_dtype,
+                fixed_split_size=self.prefill_fixed_split_size,
+                disable_split_kv=self.disable_split_kv,
+            )
+            parts.append(
+                FIPrefillPart(
+                    wrapper=wrapper, causal=part_causal, tokens=to_device(tokens_np)
+                )
+            )
+        return FIPrefill(wrapper=None, parts=parts)
+
     def build(
         self,
         common_prefix_len: int,
@@ -1296,7 +1414,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         causal = common_attn_metadata.causal
-        route_decode = causal or self.use_xqa
+        per_req_causal = isinstance(causal, torch.Tensor)
+        # A per-request flag (DiffusionGemma: causal encoder requests beside
+        # bidirectional denoise requests) routes like a causal batch. A decode
+        # attends to its whole context under either mask, and the native
+        # prefill pathway plans each causal-uniform subset on its own wrapper.
+        # TRTLLM prefill takes one causal plan, so it is not used here.
+        batch_causal = True if per_req_causal else causal
+        route_decode = batch_causal or self.use_xqa
         if route_decode:
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
                 split_decodes_and_prefills(
@@ -1328,33 +1453,41 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         prefill_force_trtllm = (
             True if page_size >= 128 else self.attention_config.use_trtllm_attention
         )
-        prefill_use_trtllm = causal and use_trtllm_attention(
-            self.num_qo_heads,
-            self.num_kv_heads,
-            num_prefill_tokens,
-            max_seq_len,
-            self.dcp_world_size,
-            self.cache_dtype,
-            self.q_data_type_prefill,
-            is_prefill=True,
-            force_use_trtllm=prefill_force_trtllm,
-            has_sinks=self.has_sinks,
-            has_spec=uses_spec_reorder,
+        prefill_use_trtllm = (
+            batch_causal
+            and not per_req_causal
+            and use_trtllm_attention(
+                self.num_qo_heads,
+                self.num_kv_heads,
+                num_prefill_tokens,
+                max_seq_len,
+                self.dcp_world_size,
+                self.cache_dtype,
+                self.q_data_type_prefill,
+                is_prefill=True,
+                force_use_trtllm=prefill_force_trtllm,
+                has_sinks=self.has_sinks,
+                has_spec=uses_spec_reorder,
+            )
         )
         decode_with_flashinfer_trtllm_api = self.use_trtllm_decode_attention and (
-            causal or self.use_xqa
+            batch_causal or self.use_xqa
         )
 
-        if not causal and self.use_dcp:
+        if not batch_causal and self.use_dcp:
             raise NotImplementedError(
                 "FlashInfer non-causal prefill is not supported with DCP yet."
             )
-        if not causal and self.use_trtllm_decode_attention:
+        if per_req_causal and self.use_dcp:
+            raise NotImplementedError(
+                "FlashInfer per-request causal prefill is not supported with DCP."
+            )
+        if not batch_causal and self.use_trtllm_decode_attention:
             logger.warning_once(
                 "Using FlashInfer for draft model non-causal attention; TRTLLM "
                 "can still be used for target model causal attention."
             )
-        all_uses_trtllm = causal and (
+        all_uses_trtllm = batch_causal and (
             (num_prefills == 0 or prefill_use_trtllm)
             and (num_decodes == 0 or decode_with_flashinfer_trtllm_api)
         )
@@ -1406,9 +1539,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # seq_lens_cpu is not needed since TRTLLM paths use GPU tensors
         # (block_tables, seq_lens) directly.
         needs_seq_lens_cpu = self.use_dcp or use_cascade or not all_uses_trtllm
+        causal_np: np.ndarray | None = None
         if needs_seq_lens_cpu:
             with gpu_sync_allowed():
                 seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
+                if per_req_causal and num_prefills > 0:
+                    assert isinstance(causal, torch.Tensor)
+                    causal_np = causal[:num_reqs].cpu().numpy()
         else:
             seq_lens_cpu = None
 
@@ -1527,7 +1664,28 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
         # Step 3: Handle prefill and decode pathways case by case
         ## PREFILL PATHWAY
-        if num_prefills > 0:
+        split_flags: np.ndarray | None = None
+        if causal_np is not None and num_prefills > 0:
+            # Uniform prefills plan as one causal or one non-causal batch;
+            # mixed ones split into a part per flag.
+            flags = causal_np[num_decodes:num_reqs]
+            if flags.all():
+                attn_metadata.causal = True
+            elif not flags.any():
+                attn_metadata.causal = False
+            else:
+                split_flags = flags
+        if split_flags is not None:
+            assert num_blocks_np is not None
+            attn_metadata.prefill = self._plan_split_prefill(
+                split_flags,
+                num_decodes,
+                num_reqs,
+                qo_indptr_cpu,
+                num_blocks_np,
+                block_table_tensor,
+            )
+        elif num_prefills > 0:
             # Slices for shared prefill metadata
             prefill_start = num_decodes
             qo_indptr_prefill_cpu = (
@@ -1572,6 +1730,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     max_seq_len=max_seq_len,
                 )
             else:
+                assert isinstance(attn_metadata.causal, bool)
                 prefill_wrapper = self._get_prefill_wrapper(causal=attn_metadata.causal)
                 # Slicing CPU buffers that are only needed for FI native prefills
                 paged_kv_last_page_len_prefill_cpu = self.paged_kv_last_page_len.cpu[
@@ -1679,7 +1838,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         q_len_per_req,
                         ragged_q_lens,
                         num_decodes,
-                        bool(causal),
+                        bool(batch_causal),
                     )
                 elif self.use_trtllm_gen_varlen_decode:
                     # CPU lens are only an upper bound, device qo_indptr is
@@ -2150,7 +2309,30 @@ class FlashInferImpl(AttentionImpl):
                 layer._q_scale,
             )
 
-            if not prefill_use_trtllm:
+            if (
+                isinstance(attn_metadata.prefill, FIPrefill)
+                and attn_metadata.prefill.parts is not None
+            ):
+                assert not self.is_kvcache_nvfp4
+                out_prefill = output[num_decode_tokens:]
+                for part in attn_metadata.prefill.parts:
+                    wrapper = part.wrapper
+                    assert wrapper._causal == part.causal
+                    assert wrapper._window_left == self.window_left
+                    assert wrapper._logits_soft_cap == (self.logits_soft_cap or 0.0)
+                    assert wrapper._sm_scale == self.scale
+                    part_query = prefill_query.index_select(0, part.tokens)
+                    part_out = out_prefill.new_empty(part_query.shape)
+                    wrapper.run(
+                        part_query,
+                        kv_cache_tuple,
+                        q_scale=layer._q_scale_float,
+                        k_scale=layer._k_scale_float,
+                        v_scale=layer._v_scale_float,
+                        out=part_out,
+                    )
+                    out_prefill.index_copy_(0, part.tokens, part_out)
+            elif not prefill_use_trtllm:
                 assert isinstance(attn_metadata.prefill, FIPrefill)
                 prefill_wrapper = attn_metadata.prefill.wrapper
                 assert prefill_wrapper is not None
