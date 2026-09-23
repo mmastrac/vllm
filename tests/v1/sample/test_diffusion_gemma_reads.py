@@ -12,8 +12,8 @@ from vllm.model_executor.models.diffusion_gemma import (
     DiffusionGemmaRequestStates,
     _compiled_sample_step,
     _concat_logprob_stashes,
-    _mask_rows_to_allowed,
     _denoise_temperature,
+    _mask_rows_to_allowed,
     sample_row_stats_reference,
 )
 from vllm.platforms import current_platform
