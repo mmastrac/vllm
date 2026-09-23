@@ -42,6 +42,7 @@ from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.diffusion_scheduler import (
     DiffusionAsyncScheduler,
+    build_canvas_width_lookup,
     diffusion_canvas_width,
 )
 from vllm.v1.core.sched.interface import PauseState
@@ -7002,3 +7003,60 @@ def test_diffusion_read_deferral_keeps_a_longer_pp_wait():
     # Deferring this step alone would ask for 6. The PP wait to 7 stands.
     assert "read" not in scheduler.schedule().num_scheduled_tokens
     assert read.next_decode_eligible_step == 7
+
+
+def test_canvas_width_lookup_is_dense_and_validated():
+    lookup = build_canvas_width_lookup([(1, 1, 256), (2, 4, 128)], 256, 8)
+    # Index 0 unused; gaps and sizes past the last range keep the last width.
+    assert lookup[1:] == [256, 128, 128, 128, 128, 128, 128, 128]
+    lookup = build_canvas_width_lookup([(1, 2, 64), (5, 6, 32)], 64, 8)
+    assert lookup[1:] == [64, 64, 64, 64, 32, 32, 32, 32]
+    for bad in ([], [(2, 3, 8)], [(1, 4, 8), (3, 6, 4)], [(1, 2, 16)], [(1, 0, 8)]):
+        with pytest.raises(ValueError):
+            build_canvas_width_lookup(bad, 8, 8)
+
+
+def test_diffusion_scheduler_adapts_the_canvas_to_load():
+    """One request alone denoises the served canvas; a second arriving makes
+    new blocks narrow. A block keeps its width until its commit lands, and a
+    request that asked for a width keeps it."""
+    scheduler = _diffusion_scheduler(max_num_seqs=4)
+    scheduler.vllm_config.diffusion_config.canvas_length_per_batch_size = [
+        (1, 1, 8),
+        (2, 4, 4),
+    ]
+    scheduler.init_canvas_schedule()
+    one = _diffusion_request("one", {})
+    scheduler.add_request(one)
+    prefill = scheduler.schedule()
+    _model_output(scheduler, prefill, [[]])
+    step = scheduler.schedule()
+    assert step.num_scheduled_tokens["one"] == 8
+    _model_output(scheduler, step, [[]])
+
+    two = _diffusion_request("two", {})
+    fixed = _diffusion_request("fixed", {"diffusion_canvas_length": 2})
+    scheduler.add_request(two)
+    scheduler.add_request(fixed)
+    step = scheduler.schedule()
+    # The running block keeps its width while the newcomers prefill.
+    assert step.num_scheduled_tokens["one"] == 8
+    order = list(step.num_scheduled_tokens)
+    # "one" commits its block: 8 tokens land, the others produce nothing.
+    _model_output(
+        scheduler, step, [list(range(8)) if r == "one" else [] for r in order]
+    )
+
+    step = scheduler.schedule()
+    assert step.num_scheduled_tokens["one"] == 4
+    assert step.num_scheduled_tokens["two"] == 4
+    assert step.num_scheduled_tokens["fixed"] == 2
+
+
+def test_diffusion_scheduler_without_a_schedule_keeps_the_served_canvas():
+    scheduler = _diffusion_scheduler()
+    assert scheduler._canvas_lookup is None
+    one = _diffusion_request("one", {})
+    scheduler.add_request(one)
+    scheduler.schedule()
+    assert scheduler.schedule().num_scheduled_tokens["one"] == 8

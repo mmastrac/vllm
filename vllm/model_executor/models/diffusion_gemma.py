@@ -410,7 +410,7 @@ def _compiled_sample_step(
     all_slots: torch.Tensor,  # [num_reqs] int64 → all slot indices
     valid_canvas_len: torch.Tensor,  # [num_decode] int64 → real canvas length (<=CL)
     # State tensors (modified in-place)
-    canvas: torch.Tensor,  # [max_num_reqs, CL]
+    canvas_full: torch.Tensor,  # [max_num_reqs, served canvas]; the tile uses [:, :CL]
     argmax_canvas: torch.Tensor,  # [max_num_reqs, CL]
     step_tensor: torch.Tensor,  # [max_num_reqs]
     is_encoder_phase: torch.Tensor,  # [max_num_reqs]
@@ -454,6 +454,7 @@ def _compiled_sample_step(
     caller can compute logprobs outside the compiled region."""
     num_decode = decode_slots.shape[0]
     device = decode_slots.device
+    canvas = canvas_full[:, :CL]
 
     # ---- Phase 1: Temperature schedule ----
     steps_f = step_tensor[decode_slots].float()
@@ -479,11 +480,13 @@ def _compiled_sample_step(
     probs = log_probs.exp()
 
     token_entropy = -(probs * log_probs).sum(dim=-1)  # [num_decode, CL]
-    # A canvas truncated near max_model_len is zero-padded up to CL by the
-    # caller; those padded rows are uniform (max entropy, argmax 0), so they
-    # never trigger early convergence and are stable, and only the real
-    # ``valid_canvas_len`` tokens are committed (num_sampled below).
-    mean_entropy = token_entropy.mean(dim=-1)  # [num_decode]
+    # A canvas narrower than CL (truncated near max_model_len, or a scheduled
+    # width below the tile's) is zero-padded up to CL by the caller; those
+    # padded rows are uniform (argmax 0, stable) and are left out of the mean
+    # so they cannot hold back convergence. Only the real ``valid_canvas_len``
+    # tokens are committed (num_sampled below).
+    real = torch.arange(CL, device=device)[None, :] < valid_canvas_len[:, None]
+    mean_entropy = (token_entropy * real).sum(dim=-1) / valid_canvas_len.clamp(min=1)
     confident_tensor[decode_slots] = mean_entropy < confidence_threshold
 
     # ---- Phase 4: Entropy-bound acceptance mask ----
@@ -522,6 +525,16 @@ def _compiled_sample_step(
     canvas[decode_slots] = torch.where(
         is_commit.unsqueeze(1), random_tokens, denoise_canvas
     )
+    # A commit re-noises the whole row, not just this tile's width, so a
+    # wider next block starts from noise rather than an older block's tokens.
+    full_width = canvas_full.shape[1]
+    if full_width > CL:
+        random_full = torch.randint(
+            0, vocab_size, (num_decode, full_width), device=device, dtype=canvas.dtype
+        )
+        canvas_full[decode_slots] = torch.where(
+            is_commit.unsqueeze(1), random_full, canvas_full[decode_slots]
+        )
 
     # History: write argmax_tokens for denoise requests at circular position
     hist_len = history_len_tensor[decode_slots]
@@ -605,7 +618,7 @@ def _compiled_sample_step(
     is_encoder_phase[decode_slots] &= ~read_only[decode_slots]
 
     # ---- Phase 7: Copy canvas → draft_tokens for all slots ----
-    draft_tokens[all_slots, :CL] = canvas[all_slots]
+    draft_tokens[all_slots, : canvas_full.shape[1]] = canvas_full[all_slots]
 
     return scaled
 
@@ -1375,7 +1388,12 @@ class DiffusionSampler:
         # canvas. Widths ascend, so the last tile's canvas-to-draft copy (over
         # all slots) is the widest. The fp32 pipeline keeps several live
         # [tile * W, vocab] copies, so a tile is also bounded by free memory.
-        widths_np = states.canvas_width_np[decode_slots_np]
+        # Tile by the width the scheduler gave each request this step: an
+        # adaptive canvas runs a narrow block on a narrow tile instead of a
+        # padded one at the served width.
+        widths_np = np.minimum(
+            states.canvas_width_np[decode_slots_np], valid_canvas_len_np
+        )
         order = np.argsort(widths_np, kind="stable")
         free = current_platform.mem_get_info()[0] if num_decode > 0 else 0
         run_start = 0
@@ -1424,8 +1442,8 @@ class DiffusionSampler:
                     decode_idx[sel],
                     all_slots,
                     tile_valid,
-                    # State, viewed at this tile's width
-                    states.canvas[:, :W],
+                    # State, viewed at this tile's width (the canvas whole)
+                    states.canvas,
                     states.argmax_canvas[:, :W],
                     states.step,
                     states.is_encoder_phase,

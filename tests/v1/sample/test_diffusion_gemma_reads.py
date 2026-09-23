@@ -119,6 +119,8 @@ def _denoise_once(
     width: int = CL,
     embed_weight: torch.Tensor | None = None,
     embed_dtype: torch.dtype = torch.float32,
+    logits: torch.Tensor | None = None,
+    valid: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """One compiled denoise step over ``slots`` with flat logits, so nothing
     converges by stability or confidence and only the step cap can end it.
@@ -131,12 +133,14 @@ def _denoise_once(
     sampled = torch.zeros(n, CL, dtype=torch.int32, device=device)[:, :width]
     num_sampled = torch.zeros(n, dtype=torch.int32, device=device)
     _compiled_sample_step(
-        torch.zeros(n * width, VOCAB, device=device),
+        torch.zeros(n * width, VOCAB, device=device) if logits is None else logits,
         decode_slots,
         decode_idx,
         decode_slots,
-        torch.full((n,), width, dtype=torch.int64, device=device),
-        states.canvas[:, :width],
+        torch.full(
+            (n,), width if valid is None else valid, dtype=torch.int64, device=device
+        ),
+        states.canvas,
         states.argmax_canvas[:, :width],
         states.step,
         states.is_encoder_phase,
@@ -317,3 +321,30 @@ def test_read_emits_at_convergence_while_generation_waits_for_commit(width, step
     sampled, counts = _denoise_once(states, [0], width=width)
     assert counts.tolist() == [width]
     assert torch.equal(sampled[0], states.argmax_canvas[0, :width].int())
+
+
+def test_commit_renoises_the_whole_row_not_just_the_tile():
+    """A narrow tile's commit must leave no stale tokens past its width, or a
+    wider next block starts from an older block's text."""
+    states = _states()
+    states.add_request(0)
+    states.canvas[0] = 7
+    states.is_encoder_phase[0] = True  # this step is the commit
+
+    _denoise_once(states, [0], width=4)
+
+    assert not bool((states.canvas[0, 4:] == 7).all())
+    assert not bool(states.is_encoder_phase[0])
+
+
+def test_confidence_ignores_positions_past_the_scheduled_width():
+    """Padded positions are uniform; a block scheduled narrower than its tile
+    must still converge on its real positions."""
+    states = _states()
+    states.add_request(0)
+    logits = torch.zeros(CL, VOCAB, device="cuda")
+    logits[:2, 3] = 40.0  # two real, peaked positions; the rest are padding
+
+    _denoise_once(states, [0], logits=logits, valid=2)
+
+    assert bool(states.confident[0])
