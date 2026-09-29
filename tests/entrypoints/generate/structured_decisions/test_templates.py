@@ -126,3 +126,19 @@ def test_slot_needs_text_before_the_label():
     q = build_question("q", "choice", "", {"a": None, "b": None})
     with pytest.raises(StructuredDecisionError, match="text before the label"):
         template.render(None, [q]).slot(get_tokenizer(MODEL_NAME), q)
+
+
+def test_reply_slots():
+    tokenizer = get_tokenizer(MODEL_NAME)
+    rendered = DecisionTemplate(
+        "{% macro reply_start() %}Answers:\n{% endmacro %}"
+    ).render(None, questions())
+    reply, slots = rendered.reply_slots(tokenizer, questions())
+    assert tokenizer.decode(reply) == "Answers:\nbucket: A\nlang: A"
+    for i, (q, slot) in enumerate(zip(questions(), slots)):
+        for label, token in zip(q.labels, slot.label_ids):
+            labels = ["A", "A"]
+            labels[i] = label
+            text = f"Answers:\nbucket: {labels[0]}\nlang: {labels[1]}"
+            ids = tokenizer.encode(text, add_special_tokens=False)
+            assert ids[slot.pos] == token

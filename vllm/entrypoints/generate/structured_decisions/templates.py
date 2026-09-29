@@ -12,6 +12,10 @@ answer as the model should write it, ``"<id>: <label>"`` by default. The
 server renders the answer once per label and compares the tokens to find
 where the label goes. The system prompt can call the same macro to show the
 reply format, so the prompt shows the model the format the server reads.
+
+A read that writes every answer at once joins them with ``answer_separator()``,
+a newline by default, after ``reply_start()``, the text the model writes before
+its answers, empty by default.
 """
 
 from collections.abc import Iterator
@@ -73,6 +77,12 @@ def template_errors() -> Iterator[None]:
 
 
 @dataclass(frozen=True)
+class CanvasSlot:
+    pos: int
+    label_ids: list[int]
+
+
+@dataclass(frozen=True)
 class AnswerSlot:
     """Where a question's label goes in its rendered answer."""
 
@@ -105,7 +115,10 @@ class DecisionTemplate:
                 }
             )
         return RenderedDecision(
-            system_text=str(module), answer_macro=getattr(module, "answer", None)
+            system_text=str(module),
+            answer_macro=getattr(module, "answer", None),
+            separator_macro=getattr(module, "answer_separator", None),
+            reply_start_macro=getattr(module, "reply_start", None),
         )
 
 
@@ -113,6 +126,8 @@ class DecisionTemplate:
 class RenderedDecision:
     system_text: str
     answer_macro: Any
+    separator_macro: Any
+    reply_start_macro: Any
 
     def answer(self, question: Question, label: str) -> str:
         if self.answer_macro is None:
@@ -120,43 +135,81 @@ class RenderedDecision:
         with template_errors():
             return str(self.answer_macro(question_vars(question), label))
 
+    def _macro_text(self, macro: Any, default: str) -> str:
+        if macro is None:
+            return default
+        with template_errors():
+            return str(macro())
+
     def slot(self, tokenizer: TokenizerLike, question: Question) -> AnswerSlot:
-        """Render the answer once per label and find the one token where the
-        labels differ. Every label must be one token there, the rest of the
-        answer must not change with the label, and no two labels may share a
-        token."""
-        rendered = [
+        """Where the label goes in the question's answer on its own."""
+        variants = [
             tokenizer.encode(self.answer(question, label), add_special_tokens=False)
             for label in question.labels
         ]
-        if any(len(ids) != len(rendered[0]) for ids in rendered):
-            raise StructuredDecisionError(
-                f"question {question.id!r}: its labels are not all one token in "
-                f"the answer {self.answer(question, question.labels[0])!r}"
-            )
-        diffs = {
-            i
-            for ids in rendered[1:]
-            for i, (a, b) in enumerate(zip(rendered[0], ids))
-            if a != b
-        }
-        if len(diffs) != 1:
-            raise StructuredDecisionError(
-                f"question {question.id!r}: the labels change {len(diffs)} tokens "
-                "of the answer, and must change exactly one"
-            )
-        (pos,) = diffs
+        pos, label_ids = label_position(question, variants)
         if pos == 0:
             raise StructuredDecisionError(
                 f"question {question.id!r}: the answer must have text before the "
                 "label, such as the question id"
             )
-        label_ids = [ids[pos] for ids in rendered]
-        if len(set(label_ids)) != len(label_ids):
-            raise StructuredDecisionError(
-                f"question {question.id!r}: two labels share a token"
+        return AnswerSlot(prefix_ids=variants[0][:pos], label_ids=label_ids)
+
+    def reply_slots(
+        self, tokenizer: TokenizerLike, questions: list[Question]
+    ) -> tuple[list[int], list[CanvasSlot]]:
+        """The reply with every answer written at its first label, and where
+        each question's label goes in it."""
+        separator = self._macro_text(self.separator_macro, "\n")
+        start = self._macro_text(self.reply_start_macro, "")
+
+        def encode(labels: list[str]) -> list[int]:
+            answers = separator.join(
+                self.answer(q, label) for q, label in zip(questions, labels)
             )
-        return AnswerSlot(prefix_ids=rendered[0][:pos], label_ids=label_ids)
+            return tokenizer.encode(start + answers, add_special_tokens=False)
+
+        first = [q.labels[0] for q in questions]
+        reply = encode(first)
+        slots = []
+        for i, q in enumerate(questions):
+            variants = [reply] + [
+                encode(first[:i] + [label] + first[i + 1 :]) for label in q.labels[1:]
+            ]
+            pos, label_ids = label_position(q, variants)
+            slots.append(CanvasSlot(pos=pos, label_ids=label_ids))
+        return reply, slots
+
+
+def label_position(
+    question: Question, variants: list[list[int]]
+) -> tuple[int, list[int]]:
+    """``variants`` holds one tokenization per label of the same text. Returns
+    the one position where they differ and each label's token there. Every
+    label must be one token, the rest of the text must not change with the
+    label, and no two labels may share a token."""
+    if any(len(ids) != len(variants[0]) for ids in variants):
+        raise StructuredDecisionError(
+            f"question {question.id!r}: its labels are not all one token in the answer"
+        )
+    diffs = {
+        i
+        for ids in variants[1:]
+        for i, (a, b) in enumerate(zip(variants[0], ids))
+        if a != b
+    }
+    if len(diffs) != 1:
+        raise StructuredDecisionError(
+            f"question {question.id!r}: the labels change {len(diffs)} tokens of "
+            "the answer, and must change exactly one"
+        )
+    (pos,) = diffs
+    label_ids = [ids[pos] for ids in variants]
+    if len(set(label_ids)) != len(label_ids):
+        raise StructuredDecisionError(
+            f"question {question.id!r}: two labels share a token"
+        )
+    return pos, label_ids
 
 
 @lru_cache(maxsize=16)

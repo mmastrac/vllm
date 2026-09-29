@@ -63,10 +63,12 @@ class StructuredDecisionResponse(OpenAIBaseModel):
 
 
 class ReadPromptRequest(OpenAIBaseModel):
-    """The chat render of one read: system and state, then an assistant reply
-    left open before the question's label."""
+    """The chat render of a read. By default the last message is an assistant
+    reply left open for the model to continue."""
 
     chat_template_kwargs: dict[str, Any] | None = None
+    add_generation_prompt: bool = False
+    continue_final_message: bool = True
 
     def build_chat_params(
         self,
@@ -78,13 +80,16 @@ class ReadPromptRequest(OpenAIBaseModel):
             chat_template_content_format=default_template_content_format,
             chat_template_kwargs=merge_kwargs(
                 self.chat_template_kwargs,
-                dict(add_generation_prompt=False, continue_final_message=True),
+                dict(
+                    add_generation_prompt=self.add_generation_prompt,
+                    continue_final_message=self.continue_final_message,
+                ),
             ),
         )
 
     def build_tok_params(self, model_config: ModelConfig) -> TokenizeParams:
         return TokenizeParams(
             max_total_tokens=model_config.max_model_len,
-            max_output_tokens=1,
+            max_output_tokens=0,
             add_special_tokens=False,
         )

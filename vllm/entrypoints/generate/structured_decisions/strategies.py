@@ -8,6 +8,7 @@ name, the decision route answers 501.
 """
 
 import math
+import random
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
@@ -25,7 +26,7 @@ from vllm.utils.async_utils import merge_async_iterators
 
 from .protocol import ReadPromptRequest
 from .question_types import Question, StructuredDecisionError, label_softmax
-from .templates import DecisionTemplate
+from .templates import DecisionTemplate, RenderedDecision
 
 
 @dataclass
@@ -178,6 +179,154 @@ class NextTokenStrategy(ReadStrategy):
                     and output.token_ids[0] in slot.label_ids,
                     input_tokens=len(result.prompt_token_ids or ()),
                     output_tokens=len(output.token_ids),
+                )
+            )
+        return reads
+
+
+@register_read_strategy("canvas")
+class CanvasStrategy(ReadStrategy):
+    """Diffusion models. One request reads every question: the chat prompt, and
+    a canvas seeded with the whole reply, each label slot left as noise. One
+    denoise step gives the label probabilities at every slot."""
+
+    CANVAS_STEP = 16
+
+    def _canvas_length(self) -> int:
+        vllm_config = self.context.engine_client.vllm_config
+        if (config := vllm_config.diffusion_config) and config.canvas_length:
+            return config.canvas_length
+        return vllm_config.model_config.hf_config.canvas_length
+
+    def limits(self) -> DecisionLimits:
+        # Every answer takes at least three canvas positions: id, label and
+        # separator.
+        return DecisionLimits(
+            max_questions=self._canvas_length() // 3,
+            max_options=MAX_LOGPROB_TOKEN_IDS,
+        )
+
+    def _width(self, need: int) -> int:
+        canvas = self._canvas_length()
+        if need > canvas:
+            raise StructuredDecisionError(
+                f"the answers need {need} canvas positions and the canvas holds "
+                f"{canvas}"
+            )
+        if not self.context.engine_client.vllm_config.scheduler_config.async_scheduling:
+            return canvas
+        return min(canvas, -(-need // self.CANVAS_STEP) * self.CANVAS_STEP)
+
+    async def _render(self, messages: list[dict[str, str]], **flags: Any) -> list[int]:
+        ctx = self.context
+        _, (engine_input,) = await ctx.online_renderer.preprocess_chat(
+            ReadPromptRequest(**flags),
+            messages,
+            default_template=ctx.chat_template,
+            default_template_content_format=ctx.chat_template_content_format,
+            default_template_kwargs=ctx.default_chat_template_kwargs,
+        )
+        ids = extract_prompt_components(
+            ctx.engine_client.model_config, engine_input
+        ).token_ids
+        return list(ids or ())
+
+    async def _end_of_reply(
+        self, rendered: RenderedDecision, chat_template_kwargs: dict[str, Any] | None
+    ) -> int:
+        """The token the chat template puts right after a finished reply."""
+        messages = [
+            {"role": "system", "content": rendered.system_text},
+            {"role": "user", "content": "x"},
+            {"role": "assistant", "content": "x"},
+        ]
+        kwargs = {"chat_template_kwargs": chat_template_kwargs}
+        open_ids = await self._render(messages, **kwargs)
+        closed_ids = await self._render(
+            messages, continue_final_message=False, **kwargs
+        )
+        if len(closed_ids) <= len(open_ids) or closed_ids[: len(open_ids)] != open_ids:
+            raise StructuredDecisionError(
+                "the chat template does not end a reply with a token"
+            )
+        return closed_ids[len(open_ids)]
+
+    async def read(
+        self,
+        questions: list[Question],
+        template: DecisionTemplate,
+        instructions: str | None,
+        state: str,
+        *,
+        request_id: str,
+        chat_template_kwargs: dict[str, Any] | None,
+        lora_request: LoRARequest | None,
+        priority: int,
+    ) -> list[QuestionRead]:
+        ctx = self.context
+        tokenizer = ctx.online_renderer.renderer.get_tokenizer()
+        rendered = template.render(instructions, questions)
+        reply, slots = rendered.reply_slots(tokenizer, questions)
+        end = await self._end_of_reply(rendered, chat_template_kwargs)
+        if tokenizer.pad_token_id is None:
+            raise StructuredDecisionError("the tokenizer has no pad token")
+        width = self._width(len(reply) + 1)
+
+        canvas = reply + [end] + [tokenizer.pad_token_id] * (width - len(reply) - 1)
+        rng = random.Random(request_id)
+        vocab_size = ctx.engine_client.model_config.get_vocab_size()
+        for slot in slots:
+            canvas[slot.pos] = rng.randrange(vocab_size)
+
+        messages = [
+            {"role": "system", "content": rendered.system_text},
+            {"role": "user", "content": state},
+        ]
+        _, (engine_input,) = await ctx.online_renderer.preprocess_chat(
+            ReadPromptRequest(
+                chat_template_kwargs=chat_template_kwargs,
+                add_generation_prompt=True,
+                continue_final_message=False,
+            ),
+            messages,
+            default_template=ctx.chat_template,
+            default_template_content_format=ctx.chat_template_content_format,
+            default_template_kwargs=ctx.default_chat_template_kwargs,
+        )
+        params = SamplingParams(
+            max_tokens=width,
+            logprob_token_ids=sorted({t for s in slots for t in s.label_ids}),
+            extra_args={
+                "diffusion_seed_canvas": canvas,
+                "diffusion_canvas_length": width,
+                "diffusion_max_steps": 1,
+                "diffusion_read_only": True,
+            },
+        )
+        result = None
+        async for result in ctx.engine_client.generate(
+            engine_input,
+            params,
+            request_id,
+            lora_request=lora_request,
+            priority=priority,
+        ):
+            pass
+        if result is None or not result.outputs or not result.outputs[0].logprobs:
+            raise RuntimeError("the canvas read returned no logprobs")
+        output = result.outputs[0]
+
+        reads = []
+        for i, slot in enumerate(slots):
+            logprobs = output.logprobs[slot.pos]
+            label_logprobs = [logprobs[t].logprob for t in slot.label_ids]
+            reads.append(
+                QuestionRead(
+                    probs=label_softmax(label_logprobs),
+                    label_mass=sum(math.exp(lp) for lp in label_logprobs),
+                    argmax_is_label=output.token_ids[slot.pos] in slot.label_ids,
+                    input_tokens=len(result.prompt_token_ids or ()) if i == 0 else 0,
+                    output_tokens=len(output.token_ids) if i == 0 else 0,
                 )
             )
         return reads
