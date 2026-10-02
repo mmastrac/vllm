@@ -183,9 +183,7 @@ class RenderedDecision:
     def slot(self, tokenizer: TokenizerLike, question: Question) -> AnswerSlot:
         labels = list(question.labels)
         if len(labels) == 1:
-            # The slot is the token where two labels' answers differ, so a
-            # lone option borrows a second label to find it. The read drops
-            # the borrowed label's token.
+            # label_position needs us to tokenize with a throwaway label
             labels.append(next(c for c in LABEL_CANDIDATES if c != labels[0]))
         variants = [
             tokenizer.encode(self.answer(question, label), add_special_tokens=False)
