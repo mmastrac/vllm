@@ -19,6 +19,7 @@ def server():
         "--max-num-seqs",
         "32",
         "--enable-prefix-caching",
+        "--enable-structured-decisions",
     ]
     with RemoteOpenAIServer(MODEL_NAME, args) as remote_server:
         yield remote_server
@@ -69,6 +70,28 @@ def test_choice_decision(server):
         assert 0.0 < diag["label_mass"] <= 1.0 + 1e-6
     assert body["usage"]["output_tokens"] == 2
     assert body["usage"]["input_tokens"] > 0
+
+
+def test_one_option_choice(server):
+    response = post(
+        server,
+        {
+            "model": MODEL_NAME,
+            "state": "Team: billing.",
+            "questions": {
+                "team": choice("Which team does the message name?", "billing")
+            },
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    team = body["answers"]["team"]
+    assert team["choice"] == "billing"
+    assert team["probabilities"] == {"billing": 1.0}
+    assert team["confidence"] == pytest.approx(
+        body["diagnostics"]["team"]["label_mass"]
+    )
 
 
 # Qwen3-0.6B gets a single read of these wrong for some label shuffles, so

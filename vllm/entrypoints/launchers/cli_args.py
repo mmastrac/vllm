@@ -163,6 +163,9 @@ class BaseFrontendArgs:
     enable_tokenizer_info_endpoint: bool = False
     """Enable the `/tokenizer_info` endpoint. May expose chat
     templates and other tokenizer configuration."""
+    enable_structured_decisions: bool = False
+    """Enable the `/v1/systemone` structured decisions endpoint. Models outside
+    its tested architectures get a 501."""
     enable_log_outputs: bool = False
     """If set to True, log model outputs (generations). Requires
     `--enable-log-requests`. Output text and finish reasons are logged at INFO,
