@@ -14,14 +14,13 @@ from vllm.entrypoints.generate.structured_decisions.strategies import (
 )
 
 
-def model(architecture: str, is_diffusion: bool = False) -> Any:
-    return SimpleNamespace(architecture=architecture, is_diffusion=is_diffusion)
+def model(architecture: str) -> Any:
+    return SimpleNamespace(architecture=architecture)
 
 
 def test_strategy_selection():
     assert select_read_strategy(model("Qwen3ForCausalLM")) is NextTokenStrategy
     assert select_read_strategy(model("LlamaForCausalLM")) is None
-    assert select_read_strategy(model("DiffusionGemmaModel", is_diffusion=True)) is None
 
 
 def test_route_needs_the_flag():

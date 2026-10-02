@@ -2,10 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Read strategies: how a model is asked for label probabilities.
 
-The next-token read serves the architectures in NEXT_TOKEN_ARCHITECTURES,
-which tests cover. A chat template can rewrite or drop a prefilled reply, so
-other models get 501 rather than a read that may be wrong. Diffusion models
-have no read strategy yet.
+Only models in NEXT_TOKEN_ARCHITECTURES are currently supported.
 """
 
 import math
@@ -164,8 +161,6 @@ NEXT_TOKEN_ARCHITECTURES = frozenset(
 
 
 def select_read_strategy(model_config: ModelConfig) -> type[ReadStrategy] | None:
-    if model_config.is_diffusion:
-        return None
     if model_config.architecture in NEXT_TOKEN_ARCHITECTURES:
         return NextTokenStrategy
     return None
