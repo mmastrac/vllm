@@ -4,10 +4,8 @@ The `/v1/systemone` endpoint answers a set of typed questions about a state and
 returns a probability for every allowed answer.
 
 The endpoint is off unless the server starts with
-`--enable-structured-decisions`. The endpoint serves two tested architectures:
-`Qwen3ForCausalLM` (Qwen3) and `Qwen3_5MoeForConditionalGeneration` (Qwen3.5
-and Qwen3.6 MoE). Other models get a 501. A chat template can rewrite
-or drop a prefilled reply, and each read needs that reply intact.
+`--enable-structured-decisions`. The endpoint only serves models that support
+structured decisions, and other models will return 501.
 
 ## How it works
 

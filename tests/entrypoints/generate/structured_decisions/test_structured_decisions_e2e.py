@@ -94,6 +94,29 @@ def test_one_option_choice(server):
     )
 
 
+def test_one_option_coin_flip(server):
+    # A fair coin with only "heads" allowed. The answer is forced, so its
+    # confidence must come from the model: Qwen3-0.6B writes "heads" instead
+    # of the label, and label_mass stays near 0.
+    response = post(
+        server,
+        {
+            "model": MODEL_NAME,
+            "state": "I flip a fair coin.",
+            "questions": {"coin": choice("How did the coin land?", "heads")},
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    coin = body["answers"]["coin"]
+    assert coin["probabilities"] == {"heads": 1.0}
+    assert coin["confidence"] == pytest.approx(
+        body["diagnostics"]["coin"]["label_mass"]
+    )
+    assert coin["confidence"] < 0.5
+
+
 # Qwen3-0.6B gets a single read of these wrong for some label shuffles, so
 # each case averages 16 seeds.
 @pytest.mark.parametrize(
