@@ -15,6 +15,7 @@ from vllm.entrypoints.generate.structured_decisions.strategies import (
     reply_label_ids,
     select_read_strategy,
 )
+from vllm.entrypoints.openai.decisions.api_router import register_decisions_api_router
 
 
 def model(architecture: str, logprobs_mode: str = "raw_logprobs") -> Any:
@@ -36,8 +37,10 @@ def test_route_needs_the_flag():
         app = FastAPI()
         app.state.args = SimpleNamespace(enable_structured_decisions=enabled)
         register_structured_decisions_api_router(app)
+        register_decisions_api_router(app)
         paths = {getattr(route, "path", None) for route in app.routes}
         assert ("/v1/systemone" in paths) == enabled
+        assert ("/v1/decisions" in paths) == enabled
 
 
 @pytest.fixture(scope="module")

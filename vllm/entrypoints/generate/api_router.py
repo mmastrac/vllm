@@ -59,6 +59,12 @@ def register_generate_api_routers(app: FastAPI):
 
     register_structured_decisions_api_router(app)
 
+    from vllm.entrypoints.openai.decisions.api_router import (
+        register_decisions_api_router,
+    )
+
+    register_decisions_api_router(app)
+
 
 async def init_generate_state(
     engine_client: "EngineClient",
@@ -251,5 +257,19 @@ async def init_generate_state(
             request_logger=request_logger,
         )
         if strategy_cls is not None
+        else None
+    )
+
+    from vllm.entrypoints.openai.decisions.serving import (
+        OpenAIServingDecisions,
+    )
+
+    state.openai_serving_decisions = (
+        OpenAIServingDecisions(
+            state.openai_serving_models,
+            state.serving_structured_decisions.strategy,
+            request_logger=request_logger,
+        )
+        if state.serving_structured_decisions is not None
         else None
     )

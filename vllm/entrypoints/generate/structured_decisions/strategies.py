@@ -48,6 +48,8 @@ class QuestionRead:
     argmax_is_label: bool
     input_tokens: int
     output_tokens: int
+    cached_tokens: int = 0
+    cache_write_tokens: int = 0
 
 
 class ReadStrategy(ABC):
@@ -199,6 +201,10 @@ class NextTokenStrategy(ReadStrategy):
                     and output.token_ids[0] in ids,
                     input_tokens=len(label_read.result.prompt_token_ids or ()),
                     output_tokens=len(output.token_ids),
+                    cached_tokens=label_read.result.num_cached_tokens or 0,
+                    cache_write_tokens=(
+                        label_read.result.num_cache_creation_tokens or 0
+                    ),
                 )
             )
         return reads

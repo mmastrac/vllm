@@ -79,6 +79,9 @@ For further details on speech to text, please refer to [this page](speech_to_tex
 - [Structured Decisions API](structured_decisions.md) (`/v1/systemone`)
     - Applicable to [text generation models](../../models/generative_models.md) with a [chat template](#chat-template).
     - Answers typed questions about a state with a probability for every allowed answer.
+- [Decisions API](decisions.md) (`/v1/decisions`)
+    - OpenAI-compatible text predicates, choices, and scores.
+    - Enabled with `--enable-structured-decisions`.
 
 ## Instrumentator APIs
 
