@@ -26,7 +26,13 @@ from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import TokenizerLike
 
 from .protocol import ReadPromptRequest
-from .question_types import LABELS, Question, StructuredDecisionError, label_softmax
+from .question_types import (
+    LABELS,
+    QUESTION_TYPES,
+    Question,
+    StructuredDecisionError,
+    label_softmax,
+)
 
 
 @dataclass
@@ -83,15 +89,17 @@ def prompt_tail(tokenizer: TokenizerLike, prompt_ids: Sequence[int]) -> list[int
 
 
 def reply_label_ids(
-    tokenizer: TokenizerLike, prompt_ids: Sequence[int]
+    tokenizer: TokenizerLike,
+    prompt_ids: Sequence[int],
+    labels: Sequence[str] = LABELS,
 ) -> tuple[list[int], list[int]]:
-    """The prompt's ids after its last added token, and the token each of LABELS
-    adds after them as the first token of the reply. Raises ValueError if a
-    label is not one distinct token there."""
+    """The prompt's ids after its last added token, and the token each of
+    ``labels`` adds after them as the first token of the reply. Raises
+    ValueError if a label is not one distinct token there."""
     tail = prompt_tail(tokenizer, prompt_ids)
     text = tokenizer.decode(tail)
     ids: list[int] = []
-    for label in LABELS:
+    for label in labels:
         extended = tokenizer.encode(text + label, add_special_tokens=False)
         if extended[:-1] != tail or extended[-1] in ids:
             raise ValueError(
@@ -102,6 +110,18 @@ def reply_label_ids(
     return tail, ids
 
 
+def type_label_ids(
+    tokenizer: TokenizerLike, prompt_ids: Sequence[int]
+) -> dict[str, int]:
+    """The reply's first token for each label of every registered question
+    type. Raises ValueError as reply_label_ids does."""
+    label_ids: dict[str, int] = {}
+    for qtype in QUESTION_TYPES.values():
+        _, ids = reply_label_ids(tokenizer, prompt_ids, qtype.label_set)
+        label_ids.update(zip(qtype.label_set, ids))
+    return label_ids
+
+
 class NextTokenStrategy(ReadStrategy):
     """Autoregressive models. Each question is one request: the state, then the
     question with its labeled options, and the logprobs of the label tokens as
@@ -110,11 +130,11 @@ class NextTokenStrategy(ReadStrategy):
 
     def __init__(self, context: ReadContext):
         super().__init__(context)
-        # Every prompt ends with the same generation prompt, so the labels'
-        # tokens are the same for every question.
-        self.tail, self.label_ids = reply_label_ids(
-            self._tokenizer(), self._generation_prompt()
-        )
+        # Every prompt ends with the same generation prompt, so a label's token
+        # is the same for every question.
+        prompt = self._generation_prompt()
+        self.tail = prompt_tail(self._tokenizer(), prompt)
+        self.label_ids = type_label_ids(self._tokenizer(), prompt)
 
     def _tokenizer(self) -> TokenizerLike:
         return self.context.online_renderer.renderer.get_tokenizer()
@@ -203,7 +223,7 @@ class NextTokenStrategy(ReadStrategy):
                     "these chat options end the prompt differently, so the "
                     "labels' tokens are unknown"
                 )
-            slots.append(self.label_ids[: len(q.labels)])
+            slots.append([self.label_ids[label] for label in q.labels])
             engine_inputs.append(self._read_input(engine_input, prompt_ids))
             params.append(self._sampling_params(slots[-1], prompt_ids))
 
@@ -245,7 +265,7 @@ class CanvasStrategy(NextTokenStrategy):
         tokenizer = self._tokenizer()
         self.tail = prompt_tail(tokenizer, self._generation_prompt())
         self.thought = tokenizer.encode(self.THOUGHT, add_special_tokens=False)
-        _, self.label_ids = reply_label_ids(tokenizer, self.thought)
+        self.label_ids = type_label_ids(tokenizer, self.thought)
         end = tokenizer.encode(self.END_OF_TURN, add_special_tokens=False)
         self.pad = tokenizer.pad_token_id
         if self.pad is None or len(end) != 1:
