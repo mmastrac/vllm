@@ -158,7 +158,7 @@ class NextTokenStrategy(ReadStrategy):
         return list(probe)
 
     def _sampling_params(
-        self, label_ids: list[int], prompt_ids: list[int]
+        self, label_ids: list[int], prompt_ids: list[int], seed: int = 0
     ) -> SamplingParams:
         return SamplingParams(
             max_tokens=1, temperature=0.0, logprob_token_ids=label_ids
@@ -225,7 +225,7 @@ class NextTokenStrategy(ReadStrategy):
                 )
             slots.append([self.label_ids[label] for label in q.labels])
             engine_inputs.append(self._read_input(engine_input, prompt_ids))
-            params.append(self._sampling_params(slots[-1], prompt_ids))
+            params.append(self._sampling_params(slots[-1], prompt_ids, q.seed))
 
         label_reads = await next_token_label_reads(
             ctx.engine_client,
@@ -291,11 +291,12 @@ class CanvasStrategy(NextTokenStrategy):
         self.vocab_size = vllm_config.model_config.get_vocab_size()
 
     def _sampling_params(
-        self, label_ids: list[int], prompt_ids: list[int]
+        self, label_ids: list[int], prompt_ids: list[int], seed: int = 0
     ) -> SamplingParams:
         # The noise at the label slot is drawn from the prompt, so a repeated
         # read gets the same canvas.
-        rng = random.Random(hashlib.sha256(json.dumps(prompt_ids).encode()).digest())
+        key = json.dumps([prompt_ids, seed] if seed else prompt_ids)
+        rng = random.Random(hashlib.sha256(key.encode()).digest())
         canvas = [rng.randrange(self.vocab_size), self.end]
         canvas += [self.pad] * (self.width - len(canvas))
         return SamplingParams(

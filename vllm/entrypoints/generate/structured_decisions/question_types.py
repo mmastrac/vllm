@@ -36,6 +36,10 @@ class Question:
     instructions: str
     options: tuple[Option, ...]
     labels: tuple[str, ...]
+    # Experiment only: a line after the reply instruction, and the seed for
+    # a read's noise.
+    note: str = ""
+    seed: int = 0
 
 
 class QuestionType(ABC):
@@ -71,6 +75,8 @@ class QuestionType(ABC):
             if line is not None:
                 lines.append(line)
         lines.append(self.reply_instruction)
+        if question.note:
+            lines.append(question.note)
         return "\n".join(lines)
 
 

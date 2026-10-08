@@ -20,6 +20,17 @@ class QuestionSpec(OpenAIBaseModel):
     criteria: Any = None
 
 
+class Experiment(OpenAIBaseModel):
+    """Experiment only. Each question is read ``samples`` times, each with its
+    own seed, and the probabilities are averaged over the reads."""
+
+    labels: Literal["fixed", "random"] = "fixed"
+    options: Literal["fixed", "random"] = "fixed"
+    note: str = ""
+    samples: int = Field(default=1, ge=1, le=16)
+    seed: int = 0
+
+
 class StructuredDecisionRequest(OpenAIBaseModel):
     model: str | None = None
     state: Any = Field(..., description="What the questions are about: text or JSON.")
@@ -30,6 +41,7 @@ class StructuredDecisionRequest(OpenAIBaseModel):
         default=None, description="Context placed ahead of the questions."
     )
     chat_template_kwargs: dict[str, Any] | None = None
+    experiment: Experiment | None = None
     priority: int = Field(default=0, ge=-(2**63), le=2**63 - 1)
     request_id: str = Field(default_factory=random_uuid)
 
