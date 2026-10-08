@@ -12,6 +12,7 @@ from vllm.entrypoints.generate.structured_decisions.api_router import (
 from vllm.entrypoints.generate.structured_decisions.question_types import LABELS
 from vllm.entrypoints.generate.structured_decisions.serving import state_text
 from vllm.entrypoints.generate.structured_decisions.strategies import (
+    CanvasStrategy,
     NextTokenStrategy,
     reply_label_ids,
     select_read_strategy,
@@ -26,6 +27,9 @@ def test_strategy_selection():
     qwen = "Qwen3ForCausalLM"
     assert select_read_strategy(model(qwen)) is NextTokenStrategy
     assert select_read_strategy(model(qwen, "processed_logprobs")) is NextTokenStrategy
+    assert (
+        select_read_strategy(model("DiffusionGemmaForBlockDiffusion")) is CanvasStrategy
+    )
     with pytest.raises(ValueError, match="does not support LlamaForCausalLM"):
         select_read_strategy(model("LlamaForCausalLM"))
     with pytest.raises(ValueError, match="not raw_logits"):
@@ -72,3 +76,24 @@ def test_labels_start_the_reply(qwen):
     # After a colon, Qwen writes ":A" as one token, so "A" is not one token.
     with pytest.raises(ValueError, match="not one distinct token"):
         reply_label_ids(tokenizer, tokenizer.encode("team:"))
+
+
+def test_canvas_read():
+    strategy = CanvasStrategy.__new__(CanvasStrategy)
+    strategy.thought, strategy.end, strategy.pad = [10, 11, 12, 13], 106, 0
+    strategy.width, strategy.vocab_size = 16, 1000
+    params = strategy._sampling_params([65, 66], prompt_ids=[1, 2, 3])
+    assert params.extra_args is not None
+    canvas = params.extra_args["diffusion_seed_canvas"]
+    # The label slot as noise, the end of the turn, padding.
+    assert canvas[1:] == [106] + [0] * 14
+    assert params.max_tokens == 2 and params.logprob_token_ids == [65, 66]
+    again = strategy._sampling_params([65, 66], prompt_ids=[1, 2, 3])
+    assert again.extra_args == params.extra_args
+    read_input = strategy._read_input(
+        {"type": "token", "prompt_token_ids": [1, 2, 3]}, [1, 2, 3]
+    )
+    assert read_input == {
+        "type": "token",
+        "prompt_token_ids": [1, 2, 3, 10, 11, 12, 13],
+    }
