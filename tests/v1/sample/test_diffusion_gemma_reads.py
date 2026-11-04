@@ -3,13 +3,18 @@
 """Per-request DiffusionGemma state behind structured reads: seed canvases,
 pinned positions, read-only slots and the per-slot step cap."""
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 import torch
 
+from vllm.config import VllmConfig
+from vllm.config.diffusion import DiffusionConfig
 from vllm.model_executor.models.diffusion_gemma import (
     _MASKED_LOGIT,
     DiffusionGemmaRequestStates,
+    DiffusionSampler,
     _compiled_sample_step,
     _concat_logprob_stashes,
     _denoise_temperature,
@@ -17,7 +22,11 @@ from vllm.model_executor.models.diffusion_gemma import (
     sample_row_stats_reference,
 )
 from vllm.platforms import current_platform
+from vllm.sampling_params import SamplingParams
 from vllm.v1.outputs import LogprobsTensors
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.sample.sampler import Sampler
+from vllm.v1.worker.gpu.states import RequestState
 
 pytestmark = pytest.mark.skipif(
     not current_platform.is_cuda(), reason="the sampler state lives on the GPU"
@@ -44,6 +53,142 @@ def _states() -> DiffusionGemmaRequestStates:
 def _slots(*idx: int) -> tuple[np.ndarray, torch.Tensor]:
     slots = np.array(idx, dtype=np.int64)
     return slots, torch.tensor(slots, device="cuda")
+
+
+def _sampler() -> DiffusionSampler:
+    """Build the real sampler with flat logits and no early convergence."""
+    states = _states()
+    requests = RequestState(MAX_REQS, 64, MAX_REQS * CL, CL, VOCAB, states.device)
+    return DiffusionSampler(
+        Sampler(VllmConfig(), MAX_REQS, VOCAB, states.device, requests),
+        DiffusionConfig(canvas_length=CL, max_denoising_steps=MAX_STEPS),
+        VOCAB,
+        states,
+        confidence_threshold=-1.0,
+        t_min=1.0,
+        t_max=1.0,
+        entropy_bound=0.1,
+        embed_weight=torch.ones(VOCAB, 4, device=states.device),
+        normalizer=torch.tensor(1.0, device=states.device),
+    )
+
+
+def _add_sampler_request(
+    sampler: DiffusionSampler, req_id: str, cap: int, read_only: bool = True
+) -> int:
+    """Admit a request using the runner's real state lifecycle."""
+    sampler.req_states.add_request(req_id, 2, [1, 2], 0, CL)
+    slot = sampler.req_states.req_id_to_index[req_id]
+    sampler.diffusion_states.add_request(slot)
+    sampler.add_request(
+        slot,
+        SamplingParams(
+            extra_args={"diffusion_max_steps": cap, "diffusion_read_only": read_only}
+        ),
+    )
+    sampler.req_states.apply_staged_writes()
+    sampler.apply_staged_writes()
+    return slot
+
+
+def _sampler_batch(
+    sampler: DiffusionSampler, req_ids: list[str], prefill: bool = False
+) -> InputBatch:
+    """Populate a real InputBatch with complete prompts or full-width canvases."""
+    n = len(req_ids)
+    device = sampler.diffusion_states.device
+    width = 2 if prefill else CL
+    slots, slots_gpu = _slots(*(sampler.req_states.req_id_to_index[r] for r in req_ids))
+    offsets = np.arange(n + 1, dtype=np.int32) * width
+    return replace(
+        InputBatch.make_dummy(
+            n, n * width, InputBuffers(n, n * width, device), is_padding=False
+        ),
+        req_ids=req_ids,
+        idx_mapping_np=slots,
+        idx_mapping=slots_gpu,
+        num_draft_tokens=0 if prefill else n * CL,
+        num_draft_tokens_per_req=None if prefill else np.full(n, CL, dtype=np.int32),
+        prefill_len_np=np.full(n, 2, dtype=np.int32),
+        num_computed_tokens_np=np.full(n, 0 if prefill else 2, dtype=np.int32),
+        num_computed_prefill_tokens_np=np.full(n, 0 if prefill else 2, dtype=np.int32),
+        is_prefilling_np=np.full(n, prefill),
+        has_prefill=prefill,
+        cu_num_logits_np=offsets,
+        cu_num_logits=torch.tensor(offsets, device=device),
+    )
+
+
+def _run_sampler(sampler: DiffusionSampler, req_ids: list[str], prefill: bool = False):
+    """Count actual SC matmuls through __call__; this is not a timing benchmark."""
+    batch = _sampler_batch(sampler, req_ids, prefill)
+    logits = torch.zeros(
+        batch.num_tokens, VOCAB, device=sampler.diffusion_states.device
+    )
+    # Eager operators remain visible to the profiler; no sampler method is replaced.
+    with (
+        torch.compiler.set_stance("force_eager"),
+        torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as p,
+    ):
+        output = sampler(logits, batch)
+    matmuls = sum(
+        event.count for event in p.key_averages() if event.key == "aten::matmul"
+    )
+    return output, matmuls
+
+
+def test_sampler_last_step_read_cap_and_overshoot():
+    """Only the first three of six read steps need self-conditioning at cap 4."""
+    sampler = _sampler()
+    slot = _add_sampler_request(sampler, "read", 4)
+    output, matmuls = _run_sampler(sampler, ["read"], prefill=True)
+    assert output.num_sampled.tolist() == [0]
+    assert matmuls == 0
+    assert sampler.diffusion_states.step[slot].item() == 0
+
+    for step in range(1, 7):
+        output, matmuls = _run_sampler(sampler, ["read"])
+        assert matmuls == int(step < 4)
+        assert output.num_sampled.tolist() == [CL if step >= 4 else 0]
+        assert sampler.diffusion_states.step[slot].item() == step
+        assert bool(sampler.diffusion_states.self_conditioning_embeds[slot].any()) == (
+            step < 4
+        )
+
+
+@pytest.mark.parametrize("other_read_only", [False, True], ids=["generation", "read"])
+def test_sampler_last_step_mixed_tile_preserves_live_request(other_read_only):
+    """A same-width unfinished neighbour still needs the shared tile's matmul."""
+    sampler = _sampler()
+    done = _add_sampler_request(sampler, "read", 4)
+    live = _add_sampler_request(sampler, "live", 6, read_only=other_read_only)
+    _run_sampler(sampler, ["read", "live"], prefill=True)
+    for _ in range(4):
+        output, matmuls = _run_sampler(sampler, ["read", "live"])
+        assert matmuls == 1
+    assert output.num_sampled.tolist() == [CL, 0]
+    assert not sampler.diffusion_states.self_conditioning_embeds[done].any()
+    assert sampler.diffusion_states.self_conditioning_embeds[live].any()
+    assert sampler.diffusion_states.step[[done, live]].tolist() == [4, 4]
+
+
+def test_sampler_last_step_slot_reuse_resets_cap_and_counter():
+    """A new read in a completed slot starts its own cap and SC schedule."""
+    sampler = _sampler()
+    slot = _add_sampler_request(sampler, "old", 4)
+    _run_sampler(sampler, ["old"], prefill=True)
+    for _ in range(4):
+        _run_sampler(sampler, ["old"])
+    sampler.diffusion_states.remove_request(slot)
+    sampler.req_states.remove_request("old")
+    assert _add_sampler_request(sampler, "new", 2) == slot
+    _run_sampler(sampler, ["new"], prefill=True)
+    for step in (1, 2):
+        output, matmuls = _run_sampler(sampler, ["new"])
+        assert matmuls == int(step < 2)
+        assert output.num_sampled.tolist() == [CL if step == 2 else 0]
+        assert sampler.diffusion_states.step[slot].item() == step
+    assert sampler.diffusion_states.max_steps[slot].item() == 2
 
 
 def test_seed_canvas_replaces_only_seeded_slots():
