@@ -358,6 +358,9 @@ class InputProcessor:
         session_id: str | None = None,
         kv_hints: KvHintsEnvelope | None = None,
     ) -> EngineCoreRequest:
+        # Validation normalizes parameters; keep those changes request-local.
+        if isinstance(params, (SamplingParams, PoolingParams)):
+            params = params.clone()
         self._validate_params(params, supported_tasks)
         self._validate_lora(lora_request)
 
@@ -417,8 +420,7 @@ class InputProcessor:
         sampling_params = None
         pooling_params = None
         if isinstance(params, SamplingParams):
-            # TODO: can we avoid cloning here in multiproc case?
-            sampling_params = params.clone()
+            sampling_params = params
             prompt_len = length_from_prompt_token_ids_or_embeds(
                 prompt_token_ids, prompt_embeds
             )
@@ -451,7 +453,7 @@ class InputProcessor:
             if sampling_params.trace_decode_token_ids:
                 self._normalize_trace_replay_params(sampling_params, prompt_len)
         else:
-            pooling_params = params.clone()
+            pooling_params = params
 
         # Multimodal related.
         mm_features: list[MultiModalFeatureSpec] | None = None
