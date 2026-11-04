@@ -37,6 +37,7 @@ from vllm.tracing import (
     extract_trace_headers,
     log_tracing_disabled_warning,
 )
+from vllm.utils.diffusion import resolve_diffusion_num_samples
 from vllm.v1.metrics.stats import RequestStateStats
 
 logger = init_logger(__name__)
@@ -155,6 +156,7 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
         self.renderer = engine_client.renderer
         self.input_processor = engine_client.input_processor
         vllm_config = getattr(engine_client, "vllm_config", None)
+        self.diffusion_config = getattr(vllm_config, "diffusion_config", None)
         kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
         self.has_kv_connector = kv_transfer_config is not None
 
@@ -170,6 +172,26 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
         except Exception:
             # Never fail server startup over the fingerprint.
             self.system_fingerprint = None
+
+    def _get_num_choices(
+        self, request: ChatCompletionRequest | CompletionRequest
+    ) -> int:
+        """Account for diffusion fanout without mutating the client's n."""
+        n = request.n or 1
+        extra = request.vllm_xargs
+        if (
+            not extra
+            or "diffusion_samples" not in extra
+            or not self.model_config.is_diffusion
+        ):
+            return n
+        return resolve_diffusion_num_samples(
+            n,
+            extra,
+            max_samples=self.diffusion_config.max_samples
+            if self.diffusion_config is not None
+            else 32,
+        )
 
     def _preflight(self, n: int = 1) -> None:
         """Engine checks that must run before a response is started.

@@ -251,7 +251,7 @@ class OpenAIServingChat(GenerateBaseServing):
             logger.error("Error with model %s", error_check_ret)
             return error_check_ret
 
-        self._preflight(request.n or 1)
+        self._preflight(self._get_num_choices(request))
 
         return await self.online_renderer.render_chat(request)
 
@@ -474,7 +474,7 @@ class OpenAIServingChat(GenerateBaseServing):
         first_iteration = True
 
         # Send response for each token for each request.n (index)
-        num_choices = 1 if request.n is None else request.n
+        num_choices = self._get_num_choices(request)
         previous_num_tokens = [0] * num_choices
         # TODO: Remove once all reasoning parsers use the Parser Engine.
         generated_token_ids: list[list[int]] = [[] for _ in range(num_choices)]
@@ -861,7 +861,7 @@ class OpenAIServingChat(GenerateBaseServing):
                 # ``--enable-force-include-usage``).
                 stream_per_request_metrics: PerRequestMetrics | None = None
                 # See note in chat_completion_full_generator: suppress for n>1.
-                if (request.n or 1) == 1:
+                if num_choices == 1:
                     if self.enable_per_request_metrics:
                         last_metrics = (
                             last_res.metrics if last_res is not None else None
@@ -1172,7 +1172,7 @@ class OpenAIServingChat(GenerateBaseServing):
         # Per-request metrics (timing + spec-decode acceptance) describe a single
         # generation stream. For n>1 the stats belong to only one of the n
         # sequences, so they cannot be attributed to the request; suppress.
-        if (request.n or 1) == 1:
+        if self._get_num_choices(request) == 1:
             if self.enable_per_request_metrics:
                 per_request_metrics = build_per_request_timing_metrics(
                     final_res.metrics, num_generated_tokens

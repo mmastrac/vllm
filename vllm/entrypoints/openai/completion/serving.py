@@ -102,7 +102,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
         if error_check_ret is not None:
             return error_check_ret
 
-        self._preflight(request.n or 1)
+        self._preflight(self._get_num_choices(request))
 
         return await self.online_renderer.render_completion(request)
 
@@ -288,7 +288,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
         tokenizer: TokenizerLike | None,
         request_metadata: RequestResponseMetadata,
     ) -> AsyncGenerator[str, None]:
-        num_choices = 1 if request.n is None else request.n
+        num_choices = self._get_num_choices(request)
         previous_text_lens = [0] * num_choices * num_prompts
         previous_num_tokens = [0] * num_choices * num_prompts
         has_echoed = [False] * num_choices * num_prompts
@@ -459,7 +459,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                 stream_per_request_metrics: PerRequestMetrics | None = None
                 # See note in request_output_to_completion_response: suppress when
                 # not attributable to one stream (multi-prompt or n>1).
-                if num_prompts == 1 and (request.n or 1) == 1:
+                if num_prompts == 1 and num_choices == 1:
                     if self.enable_per_request_metrics:
                         last_metrics = (
                             last_res.metrics if last_res is not None else None
@@ -617,7 +617,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
         # generation stream, so suppress them when they cannot be attributed to
         # one: multiple prompts (timestamps span prompts) or n>1 (stats belong to
         # one of the n sequences).
-        if len(final_res_batch) == 1 and (request.n or 1) == 1:
+        if len(final_res_batch) == 1 and self._get_num_choices(request) == 1:
             if self.enable_per_request_metrics:
                 last_metrics = (
                     last_final_res.metrics if last_final_res is not None else None

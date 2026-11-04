@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from vllm.config.diffusion import DiffusionConfig
 from vllm.config.multimodal import MultiModalConfig
 from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
 from vllm.entrypoints.openai.completion.protocol import CompletionRequest
@@ -21,6 +23,7 @@ from vllm.renderers.deepseek_v4 import DeepseekV4Renderer
 from vllm.renderers.hf import HfRenderer
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.tokenizers.registry import cached_tokenizer_from_config
+from vllm.utils.diffusion import validate_diffusion_sampling_params
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.metrics.stats import RequestSpecDecodeMetrics, RequestStateStats
 
@@ -147,6 +150,83 @@ def _build_renderer(model_config: MockModelConfig):
         MockVllmConfig(model_config, parallel_config=MockParallelConfig()),
         cached_tokenizer_from_config(model_config),
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("diffusion_samples", [False, True])
+@pytest.mark.parametrize("num_prompts", [1, 2])
+async def test_streaming_diffusion_samples_preserves_all_choices(
+    diffusion_samples, num_prompts
+):
+    """Fanout choices need distinct streaming slots across batched prompts."""
+    request = CompletionRequest(
+        model=MODEL_NAME,
+        prompt=["Test"] * num_prompts,
+        max_tokens=2,
+        stream=True,
+        stream_options={"include_usage": True},
+        n=1 if diffusion_samples else 4,
+        vllm_xargs={
+            "diffusion_seed_canvas": [0, 1],
+            "diffusion_pinned": [0],
+            "diffusion_samples": 4,
+        }
+        if diffusion_samples
+        else None,
+    )
+    params = request.to_sampling_params(2)
+    validate_diffusion_sampling_params(
+        params, canvas_length=2, vocab_size=128, async_scheduling=True
+    )
+    output = _make_metrics_request_output()
+    output.outputs = [
+        CompletionOutput(
+            index=i,
+            text=f"sample {i}",
+            token_ids=[100, 101],
+            cumulative_logprob=None,
+            logprobs=None,
+            finish_reason="length",
+        )
+        for i in range(params.n)
+    ]
+
+    async def results():
+        for prompt_idx in range(num_prompts):
+            yield prompt_idx, output
+
+    serving = _build_minimal_metrics_serving_completion(True)
+    serving.enable_force_include_usage = False
+    serving.model_config = MockModelConfig()
+    serving.model_config.is_diffusion = True
+    serving.diffusion_config = DiffusionConfig()
+    metadata = RequestResponseMetadata(request_id="cmpl-fanout")
+    chunks = [
+        json.loads(line.removeprefix("data: "))
+        async for line in serving.completion_stream_generator(
+            request,
+            [],
+            results(),
+            "cmpl-fanout",
+            0,
+            MODEL_NAME,
+            num_prompts,
+            None,
+            metadata,
+        )
+        if line.strip() != "data: [DONE]"
+    ]
+    assert not [chunk for chunk in chunks if "error" in chunk], chunks
+    assert [choice["index"] for chunk in chunks for choice in chunk["choices"]] == list(
+        range(4 * num_prompts)
+    )
+    assert chunks[-1]["usage"]["completion_tokens"] == 8 * num_prompts
+    assert not chunks[-1].get("metrics")
+    full = serving.request_output_to_completion_response(
+        [output] * num_prompts, request, "cmpl-fanout", 0, MODEL_NAME, None, metadata
+    )
+    assert len(full.choices) == 4 * num_prompts
+    assert full.metrics is None
 
 
 def test_completion_per_request_metrics_follow_server_flag():
