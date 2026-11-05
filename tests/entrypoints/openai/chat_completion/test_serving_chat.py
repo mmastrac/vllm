@@ -20,6 +20,7 @@ from tests.entrypoints.openai.utils import (
 from tests.utils import RemoteOpenAIServer
 from vllm._aiter_ops import is_aiter_found_and_supported
 from vllm.config import MultiModalConfig
+from vllm.config.diffusion import DiffusionConfig
 from vllm.entrypoints.generate.base.protocol import (
     DeltaMessage,
     RequestResponseMetadata,
@@ -54,6 +55,7 @@ from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.tokenizers import get_tokenizer
 from vllm.tokenizers.mistral import MistralTokenizer
 from vllm.tokenizers.registry import cached_tokenizer_from_config
+from vllm.utils.diffusion import validate_diffusion_sampling_params
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.metrics.stats import RequestStateStats
 
@@ -687,6 +689,80 @@ async def _stream_request_outputs(
 ) -> AsyncIterator[RequestOutput]:
     for request_output in request_outputs:
         yield request_output
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("diffusion_samples", [False, True])
+async def test_streaming_diffusion_samples_preserves_all_choices(diffusion_samples):
+    """All fanout children must reach the client, just as ordinary n does."""
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "Test"}],
+        stream=True,
+        stream_options={"include_usage": True, "continuous_usage_stats": True},
+        n=1 if diffusion_samples else 4,
+        vllm_xargs={
+            "diffusion_seed_canvas": [0, 1],
+            "diffusion_pinned": [0],
+            "diffusion_samples": 4,
+        }
+        if diffusion_samples
+        else None,
+    )
+    params = request.to_sampling_params(2, {})
+    validate_diffusion_sampling_params(
+        params, canvas_length=2, vocab_size=128, async_scheduling=True
+    )
+    output = _make_metrics_request_output()
+    output.outputs = [
+        CompletionOutput(
+            index=i,
+            text=f"sample {i}",
+            token_ids=[100, 101],
+            cumulative_logprob=None,
+            logprobs=None,
+            finish_reason="length",
+        )
+        for i in range(params.n)
+    ]
+    serving = _build_minimal_metrics_serving_chat(True)
+    serving.model_config = MockModelConfig()
+    serving.model_config.is_diffusion = True
+    serving.diffusion_config = DiffusionConfig()
+    chunks = [
+        json.loads(line.removeprefix("data: "))
+        async for line in serving.chat_completion_stream_generator(
+            request,
+            _single_request_output(output),
+            "chatcmpl-fanout",
+            "test-model",
+            conversation=[{"role": "user", "content": "Test"}],
+            tokenizer=None,
+            request_metadata=RequestResponseMetadata(request_id="chatcmpl-fanout"),
+        )
+        if line.strip() != "data: [DONE]"
+    ]
+    assert not [chunk for chunk in chunks if "error" in chunk], chunks
+    finished = [
+        choice["index"]
+        for chunk in chunks
+        for choice in chunk["choices"]
+        if choice.get("finish_reason") is not None
+    ]
+    assert finished == list(range(4))
+    assert chunks[-1]["usage"]["completion_tokens"] == 8
+    assert not chunks[-1].get("metrics")
+    full = await serving.chat_completion_full_generator(
+        request,
+        _single_request_output(output),
+        "chatcmpl-fanout",
+        "test-model",
+        [{"role": "user", "content": "Test"}],
+        None,
+        RequestResponseMetadata(request_id="chatcmpl-fanout"),
+    )
+    assert len(full.choices) == 4
+    assert full.metrics is None
 
 
 async def _collect_metrics_stream_chunks(
@@ -1330,7 +1406,12 @@ async def test_serving_chat_returns_correct_model_name():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [True, False])
-async def test_admission_rejection_escapes_before_response_starts(stream):
+@pytest.mark.parametrize(
+    "samples,is_diffusion,expected_n", [(None, False, 1), (4, False, 1), (4, True, 4)]
+)
+async def test_admission_rejection_escapes_before_response_starts(
+    stream, samples, is_diffusion, expected_n
+):
     """Overload rejections must propagate out of create_chat_completion.
 
     For streaming this is the only chance to return a real HTTP status: once
@@ -1340,21 +1421,31 @@ async def test_admission_rejection_escapes_before_response_starts(stream):
     mock_engine = MagicMock(spec=AsyncLLM)
     mock_engine.errored = False
     mock_engine.model_config = MockModelConfig()
+    mock_engine.model_config.is_diffusion = is_diffusion
     mock_engine.input_processor = MagicMock()
     mock_engine.renderer = _build_renderer(mock_engine.model_config)
     mock_engine.check_admission.side_effect = QueueOverflowError()
 
     serving_chat = _build_serving_chat(mock_engine)
+    serving_chat.diffusion_config = DiffusionConfig(max_samples=4)
     req = ChatCompletionRequest(
         model=MODEL_NAME,
         messages=[{"role": "user", "content": "what is 1+1?"}],
         stream=stream,
+        vllm_xargs={
+            "diffusion_samples": samples,
+            "diffusion_seed_canvas": [0, 1],
+            "diffusion_pinned": [0],
+        }
+        if samples is not None
+        else None,
     )
 
     with pytest.raises(QueueOverflowError):
         await serving_chat.create_chat_completion(req)
 
     mock_engine.generate.assert_not_called()
+    mock_engine.check_admission.assert_called_once_with(expected_n)
 
 
 @pytest.mark.asyncio

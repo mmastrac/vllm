@@ -20,6 +20,7 @@ from pydantic import ValidationError
 
 import vllm.envs as envs
 from vllm import SamplingParams
+from vllm.config.diffusion import DiffusionConfig
 from vllm.entrypoints.openai.chat_completion.protocol import (
     BatchChatCompletionRequest,
     ChatCompletionRequest,
@@ -28,6 +29,7 @@ from vllm.entrypoints.openai.completion.protocol import CompletionRequest
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs.engine import embeds_input
+from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import BeamSearchParams
 from vllm.tokenizers import deepseek_v4_encoding, deepseek_v32_encoding
 from vllm.v1.engine.input_processor import InputProcessor
@@ -92,6 +94,68 @@ def test_prompt_embeds_valid_inputs_preserved(prompt_embeds_processor, token_ids
     assert request.prompt_embeds is embeds
     assert request.prompt_token_ids == token_ids
     assert request.prompt_is_token_ids == mask
+
+
+@pytest.mark.parametrize("skip_clone", [False, True])
+def test_diffusion_fanout_params_can_be_reused(prompt_embeds_processor, skip_clone):
+    """Admitting one prompt must not make the next look like conflicting n input."""
+    processor = prompt_embeds_processor
+    processor.model_config.is_diffusion = True
+    processor.diffusion_config = DiffusionConfig(canvas_length=2)
+    processor.vllm_config.scheduler_config.async_scheduling = True
+    params = SamplingParams(
+        seed=7,
+        max_tokens=8,
+        skip_clone=skip_clone,
+        extra_args={
+            "diffusion_seed_canvas": [1, 2],
+            "diffusion_pinned": [0],
+            "diffusion_samples": 4,
+            "diffusion_read_only": True,
+        },
+    )
+    prompt = {"type": "token", "prompt_token_ids": [1, 2, 3]}
+
+    requests = [
+        processor.process_inputs(req_id, prompt, params, ("generate",))
+        for req_id in ("first", "second")
+    ]
+
+    assert params.n == 1
+    assert params.max_tokens == 8
+    assert not params.ignore_eos
+    for request in requests:
+        assert request.sampling_params is not params
+        assert request.sampling_params.n == 4
+        assert request.sampling_params.max_tokens == 2
+        assert request.sampling_params.ignore_eos
+        assert request.sampling_params.seed == 7
+        assert (request.sampling_params.extra_args is params.extra_args) == skip_clone
+
+
+def test_pooling_admission_preserves_deep_copy(prompt_embeds_processor):
+    """Pooler defaults reach the request without sharing its nested parameters."""
+    params = PoolingParams(extra_kwargs={"values": [1]})
+    request = prompt_embeds_processor.process_inputs(
+        "pool", {"type": "token", "prompt_token_ids": [1]}, params, ("plugin",)
+    )
+
+    assert request.sampling_params is None
+    assert request.pooling_params.task == "plugin"
+    assert request.pooling_params.skip_reading_prefix_cache
+    request.pooling_params.extra_kwargs["values"].append(2)
+    assert params.extra_kwargs == {"values": [1]}
+
+
+def test_input_processor_rejects_unknown_params(prompt_embeds_processor):
+    """Unsupported input retains the public type-validation error."""
+    with pytest.raises(TypeError, match="SamplingParams or PoolingParams"):
+        prompt_embeds_processor.process_inputs(
+            "invalid",
+            {"type": "token", "prompt_token_ids": [1]},
+            {},  # type: ignore[arg-type]
+            ("generate",),
+        )
 
 
 @pytest.mark.parametrize("offset", [-1, 0, 2, 3, 4, 2**127])

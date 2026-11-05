@@ -2,12 +2,49 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Request validation for discrete diffusion models."""
 
-from typing import TYPE_CHECKING
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any
 
 from vllm.exceptions import VLLMValidationError
 
 if TYPE_CHECKING:
     from vllm.sampling_params import SamplingParams
+
+
+def resolve_diffusion_num_samples(
+    n: int, extra: Mapping[str, Any], *, max_samples: int = 32
+) -> int:
+    """Resolve the same fanout count for admission and response handling."""
+    samples = extra.get("diffusion_samples")
+    if samples is None:
+        return n
+    if not isinstance(samples, int) or isinstance(samples, bool) or samples <= 0:
+        raise VLLMValidationError(
+            "diffusion_samples must be a positive integer.", parameter="extra_args"
+        )
+    if samples > max_samples:
+        raise VLLMValidationError(
+            f"diffusion_samples must be at most {max_samples} "
+            "(the served diffusion_config.max_samples).",
+            parameter="extra_args",
+        )
+    if samples > 1:
+        if (
+            extra.get("diffusion_seed_canvas") is None
+            or extra.get("diffusion_pinned") is None
+        ):
+            raise VLLMValidationError(
+                "diffusion_samples needs a diffusion_seed_canvas and "
+                "diffusion_pinned: the unpinned positions are the ones "
+                "re-noised per sample.",
+                parameter="extra_args",
+            )
+        if n != 1:
+            raise VLLMValidationError(
+                "diffusion_samples and n cannot both be set.", parameter="extra_args"
+            )
+        return samples
+    return n
 
 
 def validate_diffusion_sampling_params(
@@ -116,28 +153,4 @@ def validate_diffusion_sampling_params(
         "requires --async-scheduling.",
     )
 
-    # diffusion_samples: k fans the request out into k children, as n does.
-    # Each child re-noises the unpinned positions of the seed canvas.
-    samples = extra.get("diffusion_samples")
-    if samples is not None:
-        check(
-            isinstance(samples, int) and not isinstance(samples, bool) and samples > 0,
-            "diffusion_samples must be a positive integer.",
-        )
-        check(
-            samples <= max_samples,
-            f"diffusion_samples must be at most {max_samples} "
-            "(the served diffusion_config.max_samples).",
-        )
-        if samples > 1:
-            check(
-                seed is not None and pins is not None,
-                "diffusion_samples needs a diffusion_seed_canvas and "
-                "diffusion_pinned: the unpinned positions are the ones "
-                "re-noised per sample.",
-            )
-            check(
-                params.n == 1,
-                "diffusion_samples and n cannot both be set.",
-            )
-            params.n = samples
+    params.n = resolve_diffusion_num_samples(params.n, extra, max_samples=max_samples)
